@@ -1,0 +1,35 @@
+# Review Queue: a herdr split panel that tails ~/.claude/review.log, the same file
+# ~/.claude/hooks/review-notify.sh already writes to when a Claude Code reply contains a
+# <user_review>path</user_review> tag. review-notify.sh also invokes this plugin's `open`
+# action so the panel pops open the moment a review item lands, instead of relying only on
+# a toast notification that's easy to miss.
+id = "bh.review-panel"
+name = "Review Queue"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+description = "Split panel listing files Claude Code flags with <user_review> for you to look at."
+
+[[panes]]
+id = "sidebar"
+title = "Review Queue"
+placement = "split"
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/sidebar.sh\""]
+
+[[actions]]
+id = "open"
+title = "Review Queue: open panel"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "open"]
+
+[[actions]]
+id = "toggle"
+title = "Review Queue: toggle panel"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "toggle"]
+
+[[actions]]
+id = "clear"
+title = "Review Queue: clear log"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "clear"]
