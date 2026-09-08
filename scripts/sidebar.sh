@@ -27,6 +27,16 @@ render_line() {
   printf '%s%s%s  %s%s%s\n  %s%s%s\n\n' "$DIM" "$ts" "$RESET" "$CYAN" "$repo" "$RESET" "$YEL" "$item" "$RESET"
 }
 
-tail -n 20 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
+# Only backfill items from the last REVIEW_PANEL_WINDOW_MINUTES (default 10): the log is
+# shared across every session on the machine, so an unbounded backfill shows old, already
+#-handled items from unrelated work alongside whatever just triggered this panel to open.
+# Timestamps are "YYYY-MM-DD HH:MM:SS", so a plain string compare sorts chronologically.
+window_min="${REVIEW_PANEL_WINDOW_MINUTES:-10}"
+cutoff=$(date -d "-${window_min} minutes" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+awk -v cutoff="$cutoff" '{ts=$1" "$2; if (ts >= cutoff) print}' "$LOG" 2>/dev/null | while IFS= read -r line; do
+  render_line "$line"
+done
+
+tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
   render_line "$line"
 done
