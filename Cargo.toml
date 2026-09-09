@@ -1,0 +1,10 @@
+[package]
+name = "review-panel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "underline-color"] }
+crossterm = "0.29"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+anyhow = "1.0"
