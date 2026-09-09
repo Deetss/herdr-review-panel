@@ -1,8 +1,10 @@
 //! Parsing and tailing of `review.log`, written by `~/.claude/hooks/review-notify.sh`.
 //! Each line looks like:
-//!   2026-09-09 11:24:32 session=... repo=NAME [cwd=PATH] kind=review|command [step=LABEL] item=VALUE
+//!   2026-09-09 11:24:32 session=... repo=NAME [cwd=PATH] kind=review|command [step=LABEL] [warn=REASON] item=VALUE
 //! `kind=` is absent on lines written before commands existed - those are always `review`.
 //! `step=` is only present on commands the reply explicitly ordered (<user_command step="2a">).
+//! `warn=` is only present on commands review-notify.sh's prose heuristic flagged as reading
+//! like a paraphrased task rather than a real shell command.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -16,6 +18,9 @@ pub struct ParsedLine {
     pub cwd: Option<String>,
     pub is_command: bool,
     pub step: Option<String>,
+    /// Set when review-notify.sh's prose heuristic flagged this command as reading like a
+    /// paraphrased task rather than a real shell command (see `warn=` in the module doc).
+    pub warn: Option<String>,
     pub item: String,
 }
 
@@ -38,6 +43,9 @@ pub enum Row {
     CommandItem {
         command: String,
         step: Option<String>,
+        /// Some(reason) when the prose heuristic flagged this command - currently always
+        /// "prose" but kept as a string in case other heuristics are added later.
+        warn: Option<String>,
         key: String,
     },
 }
@@ -55,6 +63,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
     let cwd = extract_field(rest, "cwd=");
     let is_command = extract_field(rest, "kind=").as_deref() == Some("command");
     let step = extract_field(rest, "step=");
+    let warn = extract_field(rest, "warn=");
     let item = extract_rest(rest, "item=")?;
     Some(ParsedLine {
         ts: format!("{date} {time}"),
@@ -63,6 +72,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         cwd,
         is_command,
         step,
+        warn,
         item,
     })
 }
@@ -124,6 +134,7 @@ pub fn append_row(
         rows.push(Row::CommandItem {
             command: line.item.clone(),
             step: line.step.clone(),
+            warn: line.warn.clone(),
             key: item_key,
         });
     } else {
@@ -227,6 +238,7 @@ mod tests {
         assert_eq!(parsed.cwd.as_deref(), Some("/home/d"));
         assert!(!parsed.is_command);
         assert_eq!(parsed.step, None);
+        assert_eq!(parsed.warn, None);
         assert_eq!(parsed.item, "herdr-plugin.toml");
     }
 
@@ -236,7 +248,17 @@ mod tests {
         let parsed = parse_line(line).unwrap();
         assert!(parsed.is_command);
         assert_eq!(parsed.step.as_deref(), Some("2a"));
+        assert_eq!(parsed.warn, None);
         assert_eq!(parsed.item, "sudo apt update");
+    }
+
+    #[test]
+    fn parses_a_command_line_flagged_by_the_prose_heuristic() {
+        let line = "2026-09-09 12:00:00 session=abc repo=deetss cwd=/home/d kind=command warn=prose item=redeploy the app in Dokploy";
+        let parsed = parse_line(line).unwrap();
+        assert!(parsed.is_command);
+        assert_eq!(parsed.warn.as_deref(), Some("prose"));
+        assert_eq!(parsed.item, "redeploy the app in Dokploy");
     }
 
     #[test]
@@ -306,6 +328,7 @@ mod tests {
             cwd: Some("/home/d".to_string()),
             is_command,
             step: step.map(str::to_string),
+            warn: None,
             item: item.to_string(),
         }
     }
@@ -361,12 +384,34 @@ mod tests {
             &cleared,
         );
 
-        let Row::CommandItem { command, step, key } = &rows[2] else {
+        let Row::CommandItem {
+            command,
+            step,
+            warn,
+            key,
+        } = &rows[2]
+        else {
             panic!("expected CommandItem")
         };
         assert_eq!(command, "echo hi");
         assert_eq!(step.as_deref(), Some("2a"));
+        assert_eq!(warn, &None);
         assert_eq!(key, "t1|s1|echo hi");
+    }
+
+    #[test]
+    fn command_rows_carry_a_warn_reason_when_flagged() {
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        let cleared = HashSet::new();
+        let mut flagged = line("t1", "s1", "repo", true, None, "redeploy the app");
+        flagged.warn = Some("prose".to_string());
+        append_row(&mut rows, &mut last_key, &flagged, "/home/d", &cleared);
+
+        let Row::CommandItem { warn, .. } = &rows[2] else {
+            panic!("expected CommandItem")
+        };
+        assert_eq!(warn.as_deref(), Some("prose"));
     }
 
     #[test]

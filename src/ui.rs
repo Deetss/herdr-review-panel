@@ -148,7 +148,12 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             let spans = vec![Span::raw("  "), Span::styled(text, style)];
             Line::from(with_clear_glyph(spans, width))
         }
-        Row::CommandItem { command, step, key } => {
+        Row::CommandItem {
+            command,
+            step,
+            warn,
+            key,
+        } => {
             let done = app.is_done(key);
             let checkbox = if done { "[x] " } else { "[ ] " };
             let checkbox_style = if highlighted {
@@ -164,6 +169,9 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
                 theme::command()
             };
             let mut spans = vec![Span::raw("  "), Span::styled(checkbox, checkbox_style)];
+            if warn.is_some() {
+                spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
+            }
             if let Some(step) = step {
                 spans.push(Span::styled(format!("{step}. "), theme::dim()));
             }

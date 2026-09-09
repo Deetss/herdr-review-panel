@@ -27,9 +27,10 @@ first=""
 first_kind=""
 
 log_item() {
-  local kind="$1" value="$2" step="$3" step_field=""
+  local kind="$1" value="$2" step="$3" warn="$4" step_field="" warn_field=""
   [ -n "$step" ] && step_field="step=$step "
-  echo "$ts session=$session_id repo=$repo_name cwd=$cwd kind=$kind ${step_field}item=$value" >> ~/.claude/review.log
+  [ -n "$warn" ] && warn_field="warn=$warn "
+  echo "$ts session=$session_id repo=$repo_name cwd=$cwd kind=$kind ${step_field}${warn_field}item=$value" >> ~/.claude/review.log
   count=$((count + 1))
   if [ -z "$first" ]; then
     first="$value"
@@ -37,11 +38,24 @@ log_item() {
   fi
 }
 
+# Heuristic-only: flags text that reads like a paraphrased task/GUI-action description
+# rather than an actual shell command (e.g. "redeploy the app in Dokploy's UI"), so it can
+# be marked in the panel instead of trusted silently. Can false-positive on a real command
+# that happens to contain two of these words - that's fine, it's a visual nudge, not a filter.
+is_prose_command() {
+  local cmd="$1"
+  local hits
+  # -c counts matching *lines*, not occurrences - useless on a single-line string, hence -o | wc -l.
+  hits=$(grep -oiwE 'the|after|above|before|once|then|please|kindly' <<<"$cmd" | wc -l)
+  [ "$hits" -ge 2 ]
+}
+
 # Guard against false positives when a reply just talks about the <user_review> convention
 # itself (e.g. quoting the CLAUDE.md example literally) instead of naming a real file. Only
-# paths that actually exist on disk count as a genuine review request. There's no equivalent
-# cheap check for <user_command> (a shell command isn't a thing you can stat), so those are
-# logged as-is - the same trust boundary as any other command Claude proposes running.
+# paths that actually exist on disk count as a genuine review request. <user_command> has no
+# equivalent hard check (a shell command isn't a thing you can stat) - it's logged as-is, the
+# same trust boundary as any other command Claude proposes running, aside from the prose
+# heuristic below that only adds a visual warning rather than filtering anything out.
 while IFS= read -r item; do
   [ -z "$item" ] && continue
   expanded="$item"
@@ -61,7 +75,9 @@ while IFS= read -r tag; do
   step=$(grep -oP '(?<=step=")[^"]*' <<<"$tag")
   cmd=$(sed -E 's/^<user_command[^>]*>//; s/<\/user_command>$//' <<<"$tag")
   [ -z "$cmd" ] && continue
-  log_item "command" "$cmd" "$step"
+  warn=""
+  is_prose_command "$cmd" && warn="prose"
+  log_item "command" "$cmd" "$step" "$warn"
 done <<<"$command_tags"
 
 [ "$count" -eq 0 ] && exit 0
