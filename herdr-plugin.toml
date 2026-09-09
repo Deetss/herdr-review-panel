@@ -33,3 +33,47 @@ id = "clear"
 title = "Review Queue: clear log"
 contexts = ["pane", "workspace"]
 command = ["bash", "scripts/plugin.sh", "clear"]
+
+[[actions]]
+id = "close"
+title = "Review Queue: close panel"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "close"]
+
+[[actions]]
+id = "open-item"
+title = "Review Queue: open flagged file"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "open-item"]
+
+# Ctrl+click support: herdr intercepts clicks on real terminal hyperlinks, not just
+# URL-shaped plain text, so sidebar.sh emits OSC 8 hyperlinks (file:// and a synthetic
+# herdr-queue://close scheme) - the clicked target lands in HERDR_PLUGIN_CLICKED_URL in
+# plugin.sh, independent of whatever label text is shown.
+[[link_handlers]]
+id = "open-item"
+title = "Review Queue: open flagged file"
+pattern = "^file://.+$"
+action = "open-item"
+
+[[link_handlers]]
+id = "close-panel"
+title = "Review Queue: close panel"
+pattern = "^herdr-queue://close$"
+action = "close"
+
+# One popup picker in front of the review queue and other split-pane tools (memex, annotate,
+# hunkdiff), bound to a single keybind, instead of a dedicated keybind per plugin.
+[[panes]]
+id = "tools-menu"
+title = "Tools"
+placement = "popup"
+width = "60%"
+height = 14
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/tools-menu.sh\""]
+
+[[actions]]
+id = "tools-menu"
+title = "Tools: open menu"
+contexts = ["pane", "workspace"]
+command = ["bash", "scripts/plugin.sh", "tools-menu"]
