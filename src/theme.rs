@@ -76,6 +76,14 @@ pub fn clear_icon() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
 }
 
+/// Leading marker on a command review-notify.sh's prose heuristic flagged - always plain
+/// amber/bold, regardless of hover state, same reasoning as `clear_icon`.
+pub fn warn_icon() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn clear_all_button() -> Style {
     Style::default().fg(Color::Red)
 }
