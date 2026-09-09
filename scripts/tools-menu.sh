@@ -8,7 +8,7 @@ H="${HERDR_BIN_PATH:-herdr}"
 
 # label|plugin_id|action_id
 TOOLS=(
-  "Review Queue|bh.review-panel|toggle"
+  "Review Queue|deetss.review-panel|toggle"
   "Memex sidebar|nicosuave.memex|toggle"
   "Annotate: manage|annotate|manage"
   "Annotate: open here|annotate|open"

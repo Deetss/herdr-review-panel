@@ -4,7 +4,7 @@
 #   plugin.sh open       open the sidebar, no-op if one is already open
 #   plugin.sh toggle     open the sidebar, or close it if one is already open
 #   plugin.sh close      close every Review Queue pane in the workspace, no-op if none
-#   plugin.sh clear      truncate the underlying review.log
+#   plugin.sh clear      truncate the underlying review.log, done-marks, and cleared-marks files
 #   plugin.sh open-item  open the file:// path Ctrl+clicked in the sidebar (link_handlers)
 #   plugin.sh tools-menu open the fzf tool picker popup (see scripts/tools-menu.sh)
 #
@@ -16,10 +16,12 @@ mode="${1:-toggle}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 H="${HERDR_BIN_PATH:-herdr}"
-PLUGIN_ID="${HERDR_PLUGIN_ID:-bh.review-panel}"
+PLUGIN_ID="${HERDR_PLUGIN_ID:-deetss.review-panel}"
 ws="${HERDR_WORKSPACE_ID:-}"
 pane="${HERDR_PANE_ID:-}"
 QUEUE_LOG="${REVIEW_PANEL_LOG:-$HOME/.claude/review.log}"
+DONE_LOG="${REVIEW_PANEL_DONE_LOG:-$HOME/.claude/review-done.log}"
+CLEARED_LOG="${REVIEW_PANEL_CLEARED_LOG:-$HOME/.claude/review-cleared.log}"
 
 refuse() {
   printf 'review-panel: %s\n' "$1" >&2
@@ -28,6 +30,8 @@ refuse() {
 
 if [ "$mode" = "clear" ]; then
   : >"$QUEUE_LOG" 2>/dev/null || refuse "cannot clear $QUEUE_LOG"
+  : >"$DONE_LOG" 2>/dev/null
+  : >"$CLEARED_LOG" 2>/dev/null
   printf 'cleared %s\n' "$QUEUE_LOG"
   exit 0
 fi
@@ -45,19 +49,39 @@ if [ "$mode" = "open-item" ]; then
   [ -n "$url" ] || refuse "no clicked URL (HERDR_PLUGIN_CLICKED_URL unset)"
   item_path="${url#file://}"
   [ -e "$item_path" ] || refuse "no such file: $item_path"
+  # Under WSL, `code` on PATH is the Remote-WSL wrapper: it only works while its remote-cli
+  # shim exists, which requires a VS Code window currently connected to this distro. Check for
+  # that shim up front instead of just invoking `code` and handling the failure after the
+  # fact - firing the wrapper when we already know it can't connect is pointless and, on some
+  # setups, pops a distracting error window. Elsewhere (native Linux/macOS), `code` on PATH
+  # works standalone with no such precondition.
+  vscode_ready() {
+    command -v code >/dev/null 2>&1 || return 1
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+      compgen -G "$HOME/.vscode-server/bin/*/bin/remote-cli/code" >/dev/null 2>&1
+    fi
+  }
+
   # Preference order: VS Code (primary editor) -> xdg-open on the containing dir (native Linux
-  # file manager, works regardless of desktop environment) -> explorer.exe (real WSL2 only).
-  if command -v code >/dev/null 2>&1; then
-    code -g "$item_path" >/dev/null 2>&1 &
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$(dirname "$item_path")" >/dev/null 2>&1 &
+  # file manager, works regardless of desktop environment) -> explorer.exe (real WSL2 only,
+  # opens *something* on the Windows side but not necessarily the intended app/view). Run each
+  # candidate synchronously - a quick RPC/handler lookup, not a wait for the opened app itself -
+  # and check its exit status too, so an unexpected failure still falls through instead of
+  # silently opening nothing. The caller (the Rust sidebar) reports `opener=` back to the user,
+  # since explorer.exe is a degraded fallback worth calling out.
+  opener=""
+  if vscode_ready && code -g "$item_path" >/dev/null 2>&1; then
+    opener="code"
+  elif command -v xdg-open >/dev/null 2>&1 && xdg-open "$(dirname "$item_path")" >/dev/null 2>&1; then
+    opener="xdg-open"
   elif command -v explorer.exe >/dev/null 2>&1; then
     winpath=$(wslpath -w "$item_path" 2>/dev/null) || winpath="$item_path"
     explorer.exe "$winpath" >/dev/null 2>&1 &
+    opener="explorer"
   else
     refuse "no opener found (code/xdg-open/explorer.exe)"
   fi
-  printf 'opened %s\n' "$item_path"
+  printf 'opened %s opener=%s\n' "$item_path" "$opener"
   exit 0
 fi
 
