@@ -1,11 +1,13 @@
 mod actions;
 mod app;
+mod cleared;
+mod done;
 mod log;
 mod theme;
 mod ui;
 
 use anyhow::Result;
-use app::App;
+use app::{App, WHEEL_SCROLL_LINES};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
@@ -40,7 +42,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
     loop {
         let size = terminal.size()?;
-        app.ensure_cursor_visible(size.height.saturating_sub(3) as usize);
+        app.set_visible_height(size.height.saturating_sub(3) as usize);
         terminal.draw(|frame| areas = Some(ui::draw(frame, app)))?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -49,6 +51,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
                     KeyCode::Enter => app.activate_cursor(),
+                    KeyCode::Char(' ') | KeyCode::Char('d') => app.toggle_done_cursor(),
+                    KeyCode::Backspace | KeyCode::Delete => app.clear_cursor(),
                     KeyCode::Esc | KeyCode::Char('q') => app.click_close(),
                     _ => {}
                 },
@@ -59,17 +63,22 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                             MouseEventKind::Down(MouseButton::Left) => {
                                 if within(areas.close, col, row) {
                                     app.click_close();
+                                } else if within(areas.clear_all, col, row) {
+                                    app.click_clear_all();
                                 } else if within(areas.list, col, row) {
                                     let idx = app.scroll + (row - areas.list.y) as usize;
-                                    app.click_row(idx);
+                                    app.click_row(idx, col - areas.list.x, areas.list.width);
                                 }
                             }
                             MouseEventKind::Moved => {
                                 app.close_hovered = within(areas.close, col, row);
+                                app.clear_all_hovered = within(areas.clear_all, col, row);
                                 if within(areas.list, col, row) {
                                     app.cursor = Some(app.scroll + (row - areas.list.y) as usize);
                                 }
                             }
+                            MouseEventKind::ScrollUp => app.scroll_by(-WHEEL_SCROLL_LINES),
+                            MouseEventKind::ScrollDown => app.scroll_by(WHEEL_SCROLL_LINES),
                             _ => {}
                         }
                     }

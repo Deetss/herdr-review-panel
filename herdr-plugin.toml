@@ -1,15 +1,17 @@
 # Review Queue: a herdr split panel that tails ~/.claude/review.log, the same file
 # ~/.claude/hooks/review-notify.sh already writes to when a Claude Code reply contains a
-# <user_review>path</user_review> tag. review-notify.sh also invokes this plugin's `open`
-# action so the panel pops open the moment a review item lands, instead of relying only on
-# a toast notification that's easy to miss.
+# <user_review>path</user_review> tag (a file to look at, opens in the editor) or a
+# <user_command>cmd</user_command> tag (a shell command to run yourself, copies to the
+# clipboard and can be checked off - see src/done.rs). review-notify.sh also invokes this
+# plugin's `open` action so the panel pops open the moment either lands, instead of relying
+# only on a toast notification that's easy to miss.
 #
 # The sidebar itself is a compiled Rust + ratatui app (src/), not a shell script - a hand-
 # rolled bash mouse-report parser went through several rounds of real-terminal breakage
 # (misplaced elements, a broken divider, an unreliable close click) that couldn't be
 # reproduced or fixed remotely. ratatui + crossterm own terminal setup, rendering, and mouse
 # event parsing instead, the same approach clauth's herdr plugin uses.
-id = "bh.review-panel"
+id = "deetss.review-panel"
 name = "Review Queue"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
