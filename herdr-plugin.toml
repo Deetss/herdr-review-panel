@@ -1,20 +1,31 @@
 # Review Queue: a herdr split panel that tails ~/.claude/review.log, the same file
 # ~/.claude/hooks/review-notify.sh already writes to when a Claude Code reply contains a
-# <user_review>path</user_review> tag. review-notify.sh also invokes this plugin's `open`
-# action so the panel pops open the moment a review item lands, instead of relying only on
-# a toast notification that's easy to miss.
-id = "bh.review-panel"
+# <user_review>path</user_review> tag (a file to look at, opens in the editor) or a
+# <user_command>cmd</user_command> tag (a shell command to run yourself, copies to the
+# clipboard and can be checked off - see src/done.rs). review-notify.sh also invokes this
+# plugin's `open` action so the panel pops open the moment either lands, instead of relying
+# only on a toast notification that's easy to miss.
+#
+# The sidebar itself is a compiled Rust + ratatui app (src/), not a shell script - a hand-
+# rolled bash mouse-report parser went through several rounds of real-terminal breakage
+# (misplaced elements, a broken divider, an unreliable close click) that couldn't be
+# reproduced or fixed remotely. ratatui + crossterm own terminal setup, rendering, and mouse
+# event parsing instead, the same approach clauth's herdr plugin uses.
+id = "deetss.review-panel"
 name = "Review Queue"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 description = "Split panel listing files Claude Code flags with <user_review> for you to look at."
 
+[[build]]
+command = ["cargo", "build", "--release"]
+
 [[panes]]
 id = "sidebar"
 title = "Review Queue"
 placement = "split"
-command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/sidebar.sh\""]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/review-panel\""]
 
 [[actions]]
 id = "open"
@@ -46,21 +57,11 @@ title = "Review Queue: open flagged file"
 contexts = ["pane", "workspace"]
 command = ["bash", "scripts/plugin.sh", "open-item"]
 
-# Ctrl+click support: herdr intercepts clicks on real terminal hyperlinks, not just
-# URL-shaped plain text, so sidebar.sh emits OSC 8 hyperlinks (file:// and a synthetic
-# herdr-queue://close scheme) - the clicked target lands in HERDR_PLUGIN_CLICKED_URL in
-# plugin.sh, independent of whatever label text is shown.
-[[link_handlers]]
-id = "open-item"
-title = "Review Queue: open flagged file"
-pattern = "^file://.+$"
-action = "open-item"
-
-[[link_handlers]]
-id = "close-panel"
-title = "Review Queue: close panel"
-pattern = "^herdr-queue://close$"
-action = "close"
+# No link_handlers: the ratatui sidebar doesn't render OSC 8 hyperlinks at all, since herdr's
+# Ctrl+click modifier on those proved unreliable (confirmed on Windows Terminal over WSL - the
+# click never reached herdr). It owns mouse capture directly via crossterm instead, and calls
+# the `open-item`/`close` actions below itself (see src/actions.rs) exactly like the tools-menu
+# keybinding does - a plain click or Enter on a file link opens it, no modifier key needed.
 
 # One popup picker in front of the review queue and other split-pane tools (memex, annotate,
 # hunkdiff), bound to a single keybind, instead of a dedicated keybind per plugin.
