@@ -16,7 +16,7 @@ name = "Review Queue"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
-description = "Split panel listing files Claude Code flags with <user_review> for you to look at."
+description = "Split panel listing files to review and commands to run yourself, flagged by Claude Code via <user_review>/<user_command> tags."
 
 [[build]]
 command = ["cargo", "build", "--release"]
