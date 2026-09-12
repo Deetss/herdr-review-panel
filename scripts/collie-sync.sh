@@ -99,7 +99,24 @@ while IFS= read -r line; do
 
   label=$(unescape "$raw_item")
   label=${label//  / }
-  [ "${#label}" -gt 44 ] && label="${label:0:43}…"
+  # Drop a leading `cd <somewhere> && ` from the LABEL only - the command still runs verbatim.
+  # Several queued steps in one project all begin by cd'ing to the same path, so the truncation
+  # below would cut them at exactly the point where they start to differ and every row would
+  # read the same on a phone.
+  case "$label" in
+    "cd "*" && "*) label=${label#*" && "} ;;
+    "cd "*"; "*) label=${label#*"; "} ;;
+  esac
+  # Keep the TAIL when it will not fit. A chained shell command puts its boilerplate first
+  # (`set -a && . ./.env && set +a && ...`) and its payload last, so head-truncation renders
+  # every step of a project identically. Cut back to a space so a token is not sliced in half.
+  if [ "${#label}" -gt 44 ]; then
+    tail=${label: -43}
+    case "$tail" in
+      *" "*) tail=${tail#* } ;;
+    esac
+    label="…$tail"
+  fi
   [ -n "$step" ] && label="$step. $label"
 
   rows+="[[launchers]]"$'\n'
