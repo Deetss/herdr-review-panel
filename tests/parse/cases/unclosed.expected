@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/Documents/Dylan Vault
+item	command	3-retry	-	docker compose up -d
+near	tag	unclosed	<user_command>rm -rf /never
+stat	opens=2	closes=1	matched=1	fences=0	bytes=92

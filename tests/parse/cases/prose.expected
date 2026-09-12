@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/Documents/Dylan Vault
+item	command	-	prose	redeploy the app in Dokploy UI
+item	command	-	-	git status
+stat	opens=2	closes=2	matched=2	fences=0	bytes=103

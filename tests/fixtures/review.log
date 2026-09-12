@@ -1,0 +1,6 @@
+2026-09-11 18:26:26	session=fixture-session	repo=Dylan Vault	cwd=/home/deetss/Documents/Dylan Vault	kind=command	step=1	item=sudo tee /etc/fail2ban/jail.local <<'EOF'\n[sshd]\nenabled = true\nEOF
+2026-09-11 18:26:26	session=fixture-session	repo=Dylan Vault	cwd=/home/deetss/Documents/Dylan Vault	kind=command	step=2	warn=misclosed	item=sc query glpi
+2026-09-11 18:26:26	session=fixture-session	repo=Dylan Vault	cwd=/home/deetss/Documents/Dylan Vault	kind=command	step=3	item=printf 'a\\\\nb'
+2026-09-11 18:26:26	session=fixture-session	repo=Dylan Vault	cwd=/home/deetss/Documents/Dylan Vault	kind=review	warn=missing	item=README.md
+2026-09-11 18:26:26	session=fixture-session	repo=Dylan Vault	cwd=/home/deetss/Documents/Dylan Vault	kind=review	warn=missing	item=docs/gone.md
+2026-09-09 11:24:32 session=legacy repo=deetss cwd=/home/d kind=command item=git status

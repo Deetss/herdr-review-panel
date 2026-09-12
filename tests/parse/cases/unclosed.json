@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/Documents/Dylan Vault",
+  "last_assistant_message": "<user_command>rm -rf /never\n<user_command step=\"3-retry\">docker compose up -d</user_command>"
+}

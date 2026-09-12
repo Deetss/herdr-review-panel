@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/Documents/Dylan Vault",
+  "last_assistant_message": "<user_command>redeploy the app in Dokploy UI</user_command> and <user_command>git status</user_command>"
+}
