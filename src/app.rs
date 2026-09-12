@@ -32,6 +32,10 @@ pub struct App {
     pub close_hovered: bool,
     pub clear_all_hovered: bool,
     pub should_quit: bool,
+    /// The command currently shown full-screen, if any. Collie (the mobile web UI) strips ANSI
+    /// server-side, so the OSC-52 clipboard copy that activation does cannot reach a phone -
+    /// this is how the command becomes readable there. Desktop still gets the copy as well.
+    pub detail: Option<String>,
 
     log_path: PathBuf,
     offset: u64,
@@ -91,6 +95,7 @@ impl App {
             scroll: 0,
             close_hovered: false,
             clear_all_hovered: false,
+            detail: None,
             should_quit: false,
             log_path,
             offset,
@@ -366,6 +371,7 @@ impl App {
             }
             Activation::CopyCommand(command) => {
                 actions::copy_to_clipboard(&command);
+                self.detail = Some(command);
                 self.set_status("Copied to clipboard");
             }
         }
@@ -374,6 +380,12 @@ impl App {
     pub fn click_close(&mut self) {
         actions::close();
         self.should_quit = true;
+    }
+
+    /// Dismisses the detail overlay. Returns whether there was one to dismiss, so the caller
+    /// can swallow the keypress instead of also closing the panel with it.
+    pub fn dismiss_detail(&mut self) -> bool {
+        self.detail.take().is_some()
     }
 }
 

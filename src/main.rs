@@ -47,12 +47,24 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
+                // The detail overlay swallows the key that dismisses it, so Esc does not also
+                // close the whole panel on the way out.
+                Event::Key(key) if app.detail.is_some() => match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        app.dismiss_detail();
+                    }
+                    _ => {}
+                },
                 Event::Key(key) => match key.code {
                     KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
                     KeyCode::Enter => app.activate_cursor(),
                     KeyCode::Char(' ') | KeyCode::Char('d') => app.toggle_done_cursor(),
                     KeyCode::Backspace | KeyCode::Delete => app.clear_cursor(),
+                    // Shifted, because clearing everything from a stray keypress is not
+                    // recoverable. The mouse route has a dedicated button; this is its only
+                    // keyboard equivalent, which is what Collie needs since it sends no mouse.
+                    KeyCode::Char('C') => app.click_clear_all(),
                     KeyCode::Esc | KeyCode::Char('q') => app.click_close(),
                     _ => {}
                 },
