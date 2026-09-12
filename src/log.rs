@@ -1,6 +1,13 @@
-//! Parsing and tailing of `review.log`, written by `~/.claude/hooks/review-notify.sh`.
-//! Each line looks like:
-//!   2026-09-09 11:24:32 session=... repo=NAME [cwd=PATH] kind=review|command [step=LABEL] [warn=REASON] item=VALUE
+//! Parsing and tailing of `review.log`, written by `scripts/review-notify.sh`.
+//!
+//! Two line formats coexist. v2 (current) is tab-delimited:
+//!   2026-09-09 11:24:32<TAB>session=...<TAB>repo=NAME<TAB>cwd=PATH<TAB>kind=review|command<TAB>[step=LABEL]<TAB>[warn=REASON]<TAB>item=VALUE
+//! v1 (legacy) used spaces as the delimiter. v1 could not represent a value containing a
+//! space, which silently truncated every repo and cwd under a path like "Dylan Vault", and
+//! could not represent a multiline command at all. v2 values are escaped exactly as jq's
+//! `@tsv` does it (`\t` `\n` `\r` `\\`), so a value can never contain a raw delimiter and
+//! splitting is total. Lines are told apart by the presence of a tab, which v1 could not emit.
+//!
 //! `kind=` is absent on lines written before commands existed - those are always `review`.
 //! `step=` is only present on commands the reply explicitly ordered (<user_command step="2a">).
 //! `warn=` is only present on commands review-notify.sh's prose heuristic flagged as reading
@@ -21,7 +28,13 @@ pub struct ParsedLine {
     /// Set when review-notify.sh's prose heuristic flagged this command as reading like a
     /// paraphrased task rather than a real shell command (see `warn=` in the module doc).
     pub warn: Option<String>,
+    /// The decoded value, for display and for opening files.
     pub item: String,
+    /// The value exactly as it appears in the log, still escaped. Mark files key off this
+    /// rather than `item`: a decoded multiline command would write a multi-line key and
+    /// permanently corrupt cleared.rs/done.rs. For single-line items the two are identical,
+    /// so keys written before v2 keep matching.
+    pub raw_item: String,
 }
 
 /// A single row of the rendered display. Blank and GroupHeader rows are not clickable and
@@ -37,6 +50,9 @@ pub enum Row {
     FileItem {
         label: String,
         abspath: Option<String>,
+        /// Some(reason) when the hook flagged this target - e.g. "missing" for a path that
+        /// did not resolve on disk, which used to be dropped silently instead of shown.
+        warn: Option<String>,
         key: String,
     },
     /// `key` identifies this exact log entry for the done-marks and cleared-marks files.
@@ -51,6 +67,60 @@ pub enum Row {
 }
 
 pub fn parse_line(line: &str) -> Option<ParsedLine> {
+    if line.contains('\t') {
+        parse_v2(line)
+    } else {
+        parse_v1(line)
+    }
+}
+
+fn parse_v2(line: &str) -> Option<ParsedLine> {
+    let mut fields = line.split('\t');
+    let ts = fields.next()?.to_string();
+    // "YYYY-MM-DD HH:MM:SS" - guards against treating a stray tabbed line as a record.
+    if ts.len() != 19 || ts.as_bytes().get(10) != Some(&b' ') {
+        return None;
+    }
+    let mut session = String::new();
+    let (mut repo, mut cwd, mut step, mut warn) = (None, None, None, None);
+    let (mut item, mut raw_item) = (None, String::new());
+    let mut is_command = false;
+    for f in fields {
+        // Exact key match on a whole field. The v1 parser searched for "kind=" as a
+        // substring of the remainder, so a command whose text contained `kind=command`
+        // or `step="2a"` set a phantom field; here that text is inside the item value
+        // and can never be mistaken for a key.
+        let Some((k, v)) = f.split_once('=') else {
+            continue;
+        };
+        match k {
+            "session" => session = v.to_string(),
+            "repo" => repo = Some(unescape(v)),
+            "cwd" => cwd = Some(unescape(v)),
+            "kind" => is_command = v == "command",
+            "step" => step = Some(unescape(v)),
+            "warn" => warn = Some(v.to_string()),
+            "item" => {
+                raw_item = v.to_string();
+                item = Some(unescape(v));
+            }
+            _ => {}
+        }
+    }
+    Some(ParsedLine {
+        ts,
+        session,
+        repo: repo?,
+        cwd,
+        is_command,
+        step,
+        warn,
+        item: item?,
+        raw_item,
+    })
+}
+
+fn parse_v1(line: &str) -> Option<ParsedLine> {
     let mut parts = line.splitn(3, ' ');
     let date = parts.next()?;
     let time = parts.next()?;
@@ -73,8 +143,38 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         is_command,
         step,
         warn,
+        raw_item: item.clone(),
         item,
     })
+}
+
+/// Inverse of jq's `@tsv`, which is what review-parse.jq emits. An unrecognised escape is
+/// passed through verbatim so a Windows path like `C:\Users` survives even if the writer
+/// ever failed to escape it.
+fn unescape(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(o) => {
+                out.push('\\');
+                out.push(o);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn extract_field(s: &str, key: &str) -> Option<String> {
@@ -114,7 +214,7 @@ pub fn append_row(
     cleared: &HashSet<String>,
 ) {
     let key = (line.ts.clone(), line.repo.clone());
-    let item_key = format!("{}|{}|{}", line.ts, line.session, line.item);
+    let item_key = format!("{}|{}|{}", line.ts, line.session, line.raw_item);
     if cleared.contains(&item_key) {
         // Deliberately leave `last_key` untouched: recording this group as "already seen"
         // would suppress the header for the *next* (non-cleared) item in the same group,
@@ -142,6 +242,7 @@ pub fn append_row(
         rows.push(Row::FileItem {
             label: line.item.clone(),
             abspath,
+            warn: line.warn.clone(),
             key: item_key,
         });
     }
@@ -281,6 +382,173 @@ mod tests {
     }
 
     #[test]
+    fn parses_v2_with_spaces_in_repo_and_cwd() {
+        // The v1 parser split on the first space, so this vault's paths truncated to
+        // "Dylan" and every relative review item under it then failed to resolve.
+        let line = "2026-09-11 18:26:26\tsession=881a\trepo=Dylan Vault\tcwd=/home/deetss/Documents/Dylan Vault\tkind=command\tstep=6b\titem=qm set 9002 --name x";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(parsed.repo, "Dylan Vault");
+        assert_eq!(
+            parsed.cwd.as_deref(),
+            Some("/home/deetss/Documents/Dylan Vault")
+        );
+        assert!(parsed.is_command);
+        assert_eq!(parsed.step.as_deref(), Some("6b"));
+        assert_eq!(parsed.item, "qm set 9002 --name x");
+    }
+
+    #[test]
+    fn unescapes_a_multiline_item() {
+        let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=command\titem=sudo tee /x <<'EOF'\\n[sshd]\\nenabled = true\\nEOF";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(
+            parsed.item,
+            "sudo tee /x <<'EOF'\n[sshd]\nenabled = true\nEOF"
+        );
+        assert!(parsed.raw_item.contains("\\n"));
+    }
+
+    #[test]
+    fn distinguishes_a_literal_backslash_n_from_a_newline() {
+        // `printf 'a\nb'` must come back as the four characters a \ n b. If unescape and
+        // jq's @tsv ever disagree, this is the test that catches it.
+        let line =
+            "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=command\titem=printf 'a\\\\nb'";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(parsed.item, "printf 'a\\nb'");
+        assert!(!parsed.item.contains('\n'));
+    }
+
+    #[test]
+    fn an_item_containing_kind_equals_command_does_not_set_a_phantom_kind() {
+        let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=review\titem=grep kind=command /var/log/x";
+        let parsed = parse_line(line).unwrap();
+        assert!(!parsed.is_command);
+        assert_eq!(parsed.item, "grep kind=command /var/log/x");
+    }
+
+    #[test]
+    fn an_item_containing_step_equals_does_not_set_a_phantom_step() {
+        let line =
+            "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=command\titem=echo step=\"2a\"";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(parsed.step, None);
+    }
+
+    #[test]
+    fn legacy_space_delimited_lines_still_parse() {
+        let line =
+            "2026-09-09 11:24:32 session=abc repo=deetss cwd=/home/d kind=command item=git status";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(parsed.item, "git status");
+        assert_eq!(parsed.raw_item, "git status");
+    }
+
+    #[test]
+    fn the_mark_key_uses_the_escaped_item_so_it_stays_one_line() {
+        // A decoded multiline item would write a multi-line key into cleared/done and
+        // corrupt both files permanently.
+        let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=command\titem=one\\ntwo";
+        let parsed = parse_line(line).unwrap();
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        append_row(
+            &mut rows,
+            &mut last_key,
+            &parsed,
+            "/home/d",
+            &HashSet::new(),
+        );
+        let key = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::CommandItem { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !key.contains('\n'),
+            "mark key must stay on one line: {key:?}"
+        );
+        assert!(key.ends_with("one\\ntwo"));
+    }
+
+    #[test]
+    fn the_committed_fixture_log_round_trips_through_both_parsers() {
+        // tests/fixtures/review.log is written by scripts/review-notify.sh (so its escaping
+        // comes from jq's @tsv) and read here by unescape(). This is the only test that
+        // catches the two implementations drifting apart, which is the one seam in this
+        // design where a silent corruption could hide. Regenerate it with the hook, never
+        // by hand.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/review.log");
+        let text = std::fs::read_to_string(path).expect("fixture log missing");
+        let parsed: Vec<ParsedLine> = text.lines().filter_map(parse_line).collect();
+        assert_eq!(parsed.len(), 6, "every fixture line must parse");
+
+        // v2: a path with a space survives intact, which v1 could not do.
+        for p in &parsed[..5] {
+            assert_eq!(p.repo, "Dylan Vault");
+            assert_eq!(p.cwd.as_deref(), Some("/home/deetss/Documents/Dylan Vault"));
+        }
+
+        // A heredoc comes back as real newlines.
+        let heredoc = &parsed[0];
+        assert_eq!(heredoc.item.matches('\n').count(), 3);
+        assert!(
+            heredoc
+                .item
+                .starts_with("sudo tee /etc/fail2ban/jail.local <<'EOF'")
+        );
+        assert!(heredoc.item.ends_with("EOF"));
+        assert!(
+            !heredoc.raw_item.contains('\n'),
+            "log line must stay one line"
+        );
+
+        // The </parameter> misclose is recovered and flagged rather than dropped.
+        assert_eq!(parsed[1].warn.as_deref(), Some("misclosed"));
+        assert_eq!(parsed[1].item, "sc query glpi");
+
+        // Backslashes in a command are data, not escapes: nothing becomes a newline.
+        assert!(!parsed[2].item.contains('\n'));
+        assert!(parsed[2].item.starts_with("printf "));
+
+        // A review target that does not resolve is now logged with a reason.
+        assert!(!parsed[4].is_command);
+        assert_eq!(parsed[4].warn.as_deref(), Some("missing"));
+        assert_eq!(parsed[4].item, "docs/gone.md");
+
+        // v1 lines keep parsing alongside v2 ones in the same file.
+        let legacy = &parsed[5];
+        assert_eq!(legacy.repo, "deetss");
+        assert_eq!(legacy.item, "git status");
+        assert!(legacy.is_command);
+    }
+
+    #[test]
+    fn file_rows_carry_a_warn_reason_when_flagged() {
+        let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=review\twarn=missing\titem=docs/gone.md";
+        let parsed = parse_line(line).unwrap();
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        append_row(
+            &mut rows,
+            &mut last_key,
+            &parsed,
+            "/home/d",
+            &HashSet::new(),
+        );
+        let warn = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::FileItem { warn, .. } => Some(warn.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(warn.as_deref(), Some("missing"));
+    }
+
+    #[test]
     fn resolves_absolute_paths_unchanged() {
         assert_eq!(
             resolve_abspath("/etc/hosts", Some("/home/d"), "/home/d"),
@@ -330,6 +598,7 @@ mod tests {
             step: step.map(str::to_string),
             warn: None,
             item: item.to_string(),
+            raw_item: item.to_string(),
         }
     }
 

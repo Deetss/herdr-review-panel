@@ -134,7 +134,12 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             ];
             Line::from(with_clear_glyph(spans, width))
         }
-        Row::FileItem { label, abspath, .. } => {
+        Row::FileItem {
+            label,
+            abspath,
+            warn,
+            ..
+        } => {
             let text = abspath.clone().unwrap_or_else(|| label.clone());
             let style = if abspath.is_some() {
                 if highlighted {
@@ -145,7 +150,11 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             } else {
                 theme::close_button() // plain yellow, no underline - not a real link
             };
-            let spans = vec![Span::raw("  "), Span::styled(text, style)];
+            let mut spans = vec![Span::raw("  ")];
+            if warn.is_some() {
+                spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
+            }
+            spans.push(Span::styled(text, style));
             Line::from(with_clear_glyph(spans, width))
         }
         Row::CommandItem {
@@ -175,7 +184,13 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             if let Some(step) = step {
                 spans.push(Span::styled(format!("{step}. "), theme::dim()));
             }
-            spans.push(Span::styled(command.clone(), text_style));
+            // A ratatui Line cannot contain a newline, so a multiline command is shown on
+            // one row with visible break markers. Copying still yields the real text -
+            // Activation::CopyCommand carries the undisplayed command.
+            spans.push(Span::styled(
+                command.replace('\n', " \u{23ce} "),
+                text_style,
+            ));
             Line::from(with_clear_glyph(spans, width))
         }
     }
