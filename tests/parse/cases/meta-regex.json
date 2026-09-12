@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/Documents/Dylan Vault",
+  "last_assistant_message": "the pattern is `<user_command\\b[^>]*>.*?</user_command>` which matches"
+}

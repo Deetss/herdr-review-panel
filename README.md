@@ -40,6 +40,22 @@ itself is a small Rust + [ratatui](https://ratatui.rs) app - real mouse and keyb
 not a hand-rolled terminal escape-code parser (an earlier bash version tried that and it broke
 in ways that were hard to reproduce and fix).
 
+Tag scanning lives in `scripts/review-parse.jq`, a pure stdin-to-stdout filter with golden
+tests in `tests/parse/`; `scripts/review-notify.sh` is side effects only. The parser is
+deliberately forgiving in one direction and strict in the other. It accepts a multiline body
+and a tag mistakenly closed with `</parameter>`, because those are real things agents emit and
+silently dropping them is worse than logging them with a warning. It rejects tags carrying
+anything other than a `step` attribute, tags inside a fenced code block, and the documentation
+examples themselves, because a reply *describing* the convention should not file a queue item.
+
+Rows flagged with a reason are marked with a warning glyph rather than hidden: `misclosed` for
+the wrong closing tag, `unclosed` for an open tag with no terminator, `missing` for a review
+target that does not resolve on disk, `prose` for a "command" that reads like a paraphrased
+task, `truncated` for an over-long body.
+
+To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
+reply) and read `~/.claude/review-debug.log`.
+
 ### Panel controls
 
 | Action | Mouse | Keyboard |
@@ -62,16 +78,30 @@ live across multiple open panel instances.
 herdr plugin install Deetss/herdr-review-panel
 ```
 
-Then wire up the hook and tag conventions - add to your Claude Code settings
-(`~/.claude/settings.json`) a `Stop` and `SubagentStop` hook pointing at
-`~/.claude/hooks/review-notify.sh` (copy it from `scripts/` in this repo), and add the tag
-conventions to your `CLAUDE.md` so the agent knows to use them:
+Then wire up the hook. Add a `Stop` and `SubagentStop` hook to your Claude Code settings
+(`~/.claude/settings.json`) pointing at `~/.claude/hooks/review-notify.sh`, and make that file
+a three-line shim into this checkout rather than a copy of it:
+
+```bash
+#!/bin/bash
+target="$HOME/dev/personal/herdr-review-panel/scripts/review-notify.sh"
+[ -r "$target" ] || exit 0
+exec bash "$target"
+```
+
+A copy drifts. This one did: the panel gained a `warn=` field that the deployed writer never
+emitted, and nobody noticed because both halves looked fine on their own.
+
+Finally add the tag conventions to your `CLAUDE.md` so the agent knows to use them:
 
 ```markdown
-- Wrap any file you want reviewed in `<user_review>path/to/file</user_review>`.
-- Wrap any command you should run yourself in `<user_command>the command</user_command>`
-  (add `step="N"` for ordered steps). Write both tags wrapped in a single backtick so they
-  render as code instead of raw text.
+- Wrap any file you want reviewed in <user_review>path/to/file</user_review>.
+- Wrap any command you should run yourself in <user_command>the command</user_command>
+  (add step="N" for ordered steps). Write both tags wrapped in a single backtick so they
+  render as code instead of raw text. Close each tag with its own name - closing with
+  </parameter> is the most common way an item gets dropped. When describing the convention
+  rather than making a request, put the example in a fenced code block; the hook ignores
+  tags inside fences.
 ```
 
 Open the panel manually with `herdr plugin action invoke deetss.review-panel.open`, or bind a
@@ -90,12 +120,35 @@ Requires a Rust toolchain (stable) and [Herdr](https://herdr.dev) `>= 0.8.0`.
 
 ```bash
 cargo build --release   # produces target/release/review-panel, which herdr-plugin.toml runs
-cargo test               # 27 unit tests covering log parsing/grouping and app state
+cargo test              # unit tests covering log parsing/grouping and app state
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+
+./tests/parse/run.sh    # golden tests for the jq tag parser
+./tests/parse/corpus.sh # replays real transcripts, compares against the old parser
 ```
 
+`tests/parse/run.sh` is the fast one and the one to add a case to when a tag shape gets
+missed: drop the payload in `tests/parse/cases/<name>.json` and freeze the output next to
+it as `<name>.expected`.
+
+`tests/parse/corpus.sh` replays every reply in `~/.claude/projects` that ever contained a
+tag and fails if any body the old grep-based parser caught is now dropped without a
+suppression reason. Its harvested corpus contains real session content and is gitignored;
+never commit it.
+
+`tests/fixtures/review.log` is written by the hook and read back by a Rust test. It is the
+only thing pinning jq's `@tsv` escaping to the Rust `unescape` that decodes it, so
+regenerate it with the hook rather than editing it by hand.
+
 `herdr plugin link .` registers a local checkout for testing without publishing.
+
+**After changing the log format, rebuild release and restart any open panel.** herdr runs
+`target/release/review-panel`, not the debug build, and an already-running panel keeps the
+code it started with. A panel from before the change parses every new line to `None` and
+skips it silently, so the queue looks empty while the log fills up normally - which is
+indistinguishable from the hook not firing. `cargo build --release`, then close and reopen
+the panel.
 
 ## License
 

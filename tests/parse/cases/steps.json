@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/Documents/Dylan Vault",
+  "last_assistant_message": "<user_command step=\"1\">a</user_command> <user_command step=\"2a\">b</user_command> <user_command step=\"3-retry\">c</user_command> <user_command step=\"local-11\">d</user_command> <user_command step=\"final-2\">e</user_command> <user_command step=\"fix-3\">f</user_command> <user_command step=\"6c\">g</user_command>"
+}

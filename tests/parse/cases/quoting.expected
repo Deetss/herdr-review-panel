@@ -1,0 +1,3 @@
+ctx	s1	/home/deetss/Documents/Dylan Vault
+item	command	7c	-	guestfish --ro -a "$D" -i 2>/dev/null | grep -E "^(a|b)" > /tmp/x && echo 'done'
+stat	opens=1	closes=1	matched=1	fences=0	bytes=119

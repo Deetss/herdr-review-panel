@@ -1,0 +1,9 @@
+ctx	s1	/home/deetss/Documents/Dylan Vault
+item	command	1	-	a
+item	command	2a	-	b
+item	command	3-retry	-	c
+item	command	local-11	-	d
+item	command	final-2	-	e
+item	command	fix-3	-	f
+item	command	6c	-	g
+stat	opens=7	closes=7	matched=7	fences=0	bytes=304
