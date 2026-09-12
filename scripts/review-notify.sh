@@ -192,4 +192,11 @@ if command -v herdr >/dev/null 2>&1; then
   fi
 fi
 
+# Mirror the queue into Collie's launcher rows so it is usable from a phone, where the panel's
+# click targets cannot work (Collie sends no mouse events). No-ops when Collie is not installed.
+sync_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/collie-sync.sh"
+if [ -x "$sync_script" ]; then
+  bash "$sync_script" >/dev/null 2>&1 || dbg "  collie-sync failed"
+fi
+
 finish ok

@@ -4,7 +4,7 @@ use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 const CLEAR_ALL_LABEL: &str = "clear";
 
@@ -98,11 +98,34 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         );
     }
 
+    if let Some(command) = &app.detail {
+        render_detail(frame, list_area, command);
+    }
+
     Areas {
         close: close_button,
         clear_all: clear_all_button,
         list: list_area,
     }
+}
+
+/// Full-width, wrapped view of one command. The panel's normal rows are single-line and
+/// truncate, and a phone viewing this through Collie gets no clipboard and no horizontal
+/// scroll, so a long command is otherwise unreadable there. Real newlines are restored -
+/// unlike the list rows, which flatten them to a marker to stay one line tall.
+fn render_detail(frame: &mut Frame, area: Rect, command: &str) {
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(Span::styled("command", theme::header())),
+        Line::default(),
+    ];
+    lines.extend(command.lines().map(|l| Line::from(l.to_string())));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Esc / Enter to dismiss",
+        theme::dim(),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// Appends right-padding plus a trailing "x" to reach `width` - the per-row/per-section clear
