@@ -1,0 +1,57 @@
+# Collie Keys-tray presets for driving the Review Queue panel from a phone.
+#
+#   cp collie-keys.toml.example "$(herdr plugin config-dir herdr.collie)/keys.toml"
+#
+# Why this file exists: Collie has no terminal emulator and sends no mouse events, so the
+# panel's click targets (the `clear` and `x` buttons, clicking a row) cannot work there. It
+# does send keystrokes, and the panel binds one for nearly everything - so the panel is
+# keyboard-drivable over Collie, and this file puts the awkward keys on buttons.
+#
+# READ THIS BEFORE COPYING. A plugin pane has no agent, and operator-scope.ts only lets an
+# UNSCOPED row address such a pane. Unscoped rows replace the shipped presets on EVERY pane
+# (ADR 0018), so the shipped six are restated below - otherwise copying this file would take
+# Ctrl-C away from your agent panes. If you already have a keys.toml, merge these rows into
+# it rather than overwriting.
+#
+# You do not need a row for Up, Down, Enter, Space, Escape or Backspace: the tray's fixed
+# keyboard already has them, and those cover navigate / activate / mark done / close / clear
+# one row. Only the shifted key needs a button.
+
+# --- the shipped six, restated so an unscoped file does not remove them ---
+[[keys]]
+label = "Ctrl C"
+keys = ["ctrl+c"]
+
+[[keys]]
+label = "Ctrl D"
+keys = ["ctrl+d"]
+
+[[keys]]
+label = "Ctrl U"
+keys = ["ctrl+u"]
+
+[[keys]]
+label = "Ctrl R"
+keys = ["ctrl+r"]
+
+[[keys]]
+label = "Ctrl L"
+keys = ["ctrl+l"]
+
+[[keys]]
+label = "Ctrl Z"
+keys = ["ctrl+z"]
+
+# --- Review Queue ---
+
+# Wipes the whole queue. Behind the tray's two-tap confirm, because there is no undo.
+[[keys]]
+label = "Clear queue"
+keys = ["C"]
+danger = true
+
+# Space does this too and is already on the fixed keyboard; this is just a labelled button so
+# you do not have to remember which one marks an item done.
+[[keys]]
+label = "Done"
+keys = ["Space"]

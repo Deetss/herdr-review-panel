@@ -72,6 +72,42 @@ Checking a command off keeps it visible, struck through. Clearing removes it ent
 persist across restarts (`~/.claude/review-done.log`, `~/.claude/review-cleared.log`) and sync
 live across multiple open panel instances.
 
+## On a phone (Collie)
+
+[Collie](https://github.com/herdr-dev/collie) serves a mobile web UI for your herd over
+Tailscale. It has no terminal emulator: it strips ANSI server-side, renders the pane grid as
+text, and **sends no mouse events at all**. So the panel's click targets cannot work there,
+and no amount of changing this plugin will make them.
+
+Two things bridge the gap.
+
+**The panel is keyboard-drivable.** Collie's Keys tray already ships a fixed keyboard with the
+arrows, Enter, Space, Escape and Backspace, which cover navigate / activate / mark done /
+close / clear one row. Only "clear the whole queue" needed a key, and it is `C` — shifted,
+because there is no undo. `collie-keys.toml.example` puts it on a labelled button; read its
+header first, because an unscoped row replaces the shipped presets on every pane.
+
+Activating a command row also opens it full-screen. On the desktop that is alongside the
+clipboard copy; on a phone it is the only way to read a long command, since OSC-52 cannot
+reach a phone through a UI that strips ANSI.
+
+**Queued commands become launcher rows.** `scripts/collie-sync.sh` runs at the end of every
+hook invocation and mirrors the queue into Collie's `launchers.toml`, so each queued command
+is a button on the phone's Launch section. It rewrites only the block between its own markers;
+rows you wrote by hand are preserved. Items already checked off or cleared on the desktop drop
+out, and running one from the phone marks it done, so the two surfaces agree.
+
+Every row points at `scripts/review-run.sh <id>`, never at the command itself. That is
+deliberate. `launchers.toml` is the allowlist `POST /api/launch` matches against and it
+accepts no confirm option, so putting agent-proposed commands in it directly would make
+anything the agent suggested one tap from running over Tailscale with no reading step — the
+opposite of what `<user_command>` is for. Instead the allowlist holds only a fixed wrapper
+invocation; the id resolves against `review.log` locally, the real command is printed, and it
+runs only after an explicit `y`.
+
+Set `REVIEW_PANEL_COLLIE_ROWS` to change how many rows are mirrored (default 12). Collie picks
+up edits live, but you need to reload the page to see them.
+
 ## Install
 
 ```bash
