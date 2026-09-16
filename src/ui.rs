@@ -98,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         );
     }
 
-    if let Some(command) = &app.detail {
+    if let Some(command) = app.detail_text() {
         render_detail(frame, list_area, command);
     }
 
