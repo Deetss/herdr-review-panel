@@ -12,6 +12,13 @@ use std::time::{Duration, Instant};
 /// enough that it's gone well before you'd click something else.
 const STATUS_TTL: Duration = Duration::from_millis(1500);
 
+/// How long the full-command detail overlay stays open before auto-hiding, mirroring
+/// STATUS_TTL - a keypress (Esc/Enter/'q') still dismisses it immediately regardless. Note:
+/// this overlay exists specifically so Collie/mobile users (whose OSC-52 clipboard copy
+/// silently fails) can read and select the full command by hand, so this trims the window
+/// they have to do that before it vanishes on its own.
+const DETAIL_TTL: Duration = Duration::from_millis(2500);
+
 /// Column (within the list area, 0-indexed) where a command row's "[ ]"/"[x]" checkbox ends -
 /// a 2-space indent then the 4-char box. Clicks before this column toggle done; clicks at or
 /// past it copy the command instead. A step label (if any) renders after the checkbox, so it
@@ -32,11 +39,6 @@ pub struct App {
     pub close_hovered: bool,
     pub clear_all_hovered: bool,
     pub should_quit: bool,
-    /// The command currently shown full-screen, if any. Collie (the mobile web UI) strips ANSI
-    /// server-side, so the OSC-52 clipboard copy that activation does cannot reach a phone -
-    /// this is how the command becomes readable there. Desktop still gets the copy as well.
-    pub detail: Option<String>,
-
     log_path: PathBuf,
     offset: u64,
     home: String,
@@ -46,6 +48,11 @@ pub struct App {
     cleared: HashSet<String>,
     cleared_path: PathBuf,
     status: Option<(String, Instant)>,
+    /// The command currently shown full-screen, if any, alongside when it was shown. Collie
+    /// (the mobile web UI) strips ANSI server-side, so the OSC-52 clipboard copy that activation
+    /// does cannot reach a phone - this is how the command becomes readable there. Desktop still
+    /// gets the copy as well. Auto-hides after DETAIL_TTL, like the status toast (see detail_text).
+    detail: Option<(String, Instant)>,
     /// Rows visible in the list area as of the last frame - drives ensure_cursor_visible, and
     /// lets scroll_by clamp independently of cursor position instead of fighting it every
     /// frame (a scroll wheel tick should move the view without yanking the cursor along).
@@ -172,6 +179,16 @@ impl App {
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
+    }
+
+    /// None once DETAIL_TTL has elapsed, for the same reason status_text() expires on its own -
+    /// the 200ms poll loop redraws regardless of activity, so the overlay stops rendering on its
+    /// own without an explicit clear.
+    pub fn detail_text(&self) -> Option<&str> {
+        self.detail
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < DETAIL_TTL)
+            .map(|(cmd, _)| cmd.as_str())
     }
 
     fn mark_done(&mut self, key: &str) {
@@ -371,7 +388,7 @@ impl App {
             }
             Activation::CopyCommand(command) => {
                 actions::copy_to_clipboard(&command);
-                self.detail = Some(command);
+                self.detail = Some((command, Instant::now()));
                 self.set_status("Copied to clipboard");
             }
         }

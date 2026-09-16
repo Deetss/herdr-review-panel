@@ -49,7 +49,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             match event::read()? {
                 // The detail overlay swallows the key that dismisses it, so Esc does not also
                 // close the whole panel on the way out.
-                Event::Key(key) if app.detail.is_some() => match key.code {
+                Event::Key(key) if app.detail_text().is_some() => match key.code {
                     KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                         app.dismiss_detail();
                     }
