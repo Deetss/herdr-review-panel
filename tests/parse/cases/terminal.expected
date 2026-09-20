@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/Documents/Dylan Vault
+item	command	-	-	sudo systemctl restart nginx	ssh:jump-host
+item	command	2a	-	echo hi	tmux:main:1
+stat	opens=2	closes=2	matched=2	fences=0	bytes=152

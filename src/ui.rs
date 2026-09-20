@@ -150,11 +150,15 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             } else {
                 theme::header()
             };
-            let spans = vec![
-                Span::styled(ts.clone(), theme::dim()),
-                Span::raw("  "),
-                Span::styled(repo.clone(), repo_style),
-            ];
+            // Empty ts is the sentinel for the synthetic trailing "Completed" section (see
+            // app.rs's sweep_completed) - it has no timestamp of its own, so skip the span
+            // and its gap rather than rendering a blank-then-double-space.
+            let mut spans = Vec::new();
+            if !ts.is_empty() {
+                spans.push(Span::styled(ts.clone(), theme::dim()));
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(repo.clone(), repo_style));
             Line::from(with_clear_glyph(spans, width))
         }
         Row::FileItem {
@@ -184,6 +188,7 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             command,
             step,
             warn,
+            terminal,
             key,
         } => {
             let done = app.is_done(key);
@@ -203,6 +208,9 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             let mut spans = vec![Span::raw("  "), Span::styled(checkbox, checkbox_style)];
             if warn.is_some() {
                 spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
+            }
+            if let Some(terminal) = terminal {
+                spans.push(Span::styled(format!("[{terminal}] "), theme::dim()));
             }
             if let Some(step) = step {
                 spans.push(Span::styled(format!("{step}. "), theme::dim()));

@@ -33,7 +33,11 @@ replies:
   in your editor.
 - `` `<user_command>the command</user_command>` `` - a shell command *you* should run, not the
   agent. Click it to copy to your clipboard, or click its checkbox to mark it done. Add
-  `step="2a"` for commands that must run in a specific order.
+  `step="2a"` for commands that must run in a specific order, and `terminal="ssh:host"` (or
+  `terminal="pane:2"`, or any short label) when the command targets somewhere other than
+  wherever you happen to click it from - a remote host, say. Left off, a command run inside
+  tmux is tagged automatically with its pane (`tmux display-message -p '#S:#I'`); outside
+  tmux with no explicit `terminal=`, it carries no location at all.
 
 Matches get logged to `~/.claude/review.log` and the panel pops open automatically. The panel
 itself is a small Rust + [ratatui](https://ratatui.rs) app - real mouse and keyboard handling,
@@ -52,6 +56,11 @@ Rows flagged with a reason are marked with a warning glyph rather than hidden: `
 the wrong closing tag, `unclosed` for an open tag with no terminator, `missing` for a review
 target that does not resolve on disk, `prose` for a "command" that reads like a paraphrased
 task, `truncated` for an over-long body.
+
+Every subprocess call `review-notify.sh` makes after the log write - the toast, the panel
+pop, the Collie phone sync - runs under a `with_timeout` guard, so a hung `herdr` call or a
+stalled Tailscale sync costs only that one side effect (logged to the debug log) instead of
+Claude Code externally killing the whole hook at its own 10s budget with no trace.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
 reply) and read `~/.claude/review-debug.log`.
@@ -133,11 +142,12 @@ Finally add the tag conventions to your `CLAUDE.md` so the agent knows to use th
 ```markdown
 - Wrap any file you want reviewed in <user_review>path/to/file</user_review>.
 - Wrap any command you should run yourself in <user_command>the command</user_command>
-  (add step="N" for ordered steps). Write both tags wrapped in a single backtick so they
-  render as code instead of raw text. Close each tag with its own name - closing with
-  </parameter> is the most common way an item gets dropped. When describing the convention
-  rather than making a request, put the example in a fenced code block; the hook ignores
-  tags inside fences.
+  (add step="N" for ordered steps, and terminal="ssh:host" when it targets somewhere other
+  than wherever you're about to click it - a plain <user_command> auto-tags with the current
+  tmux pane instead). Write both tags wrapped in a single backtick so they render as code
+  instead of raw text. Close each tag with its own name - closing with </parameter> is the
+  most common way an item gets dropped. When describing the convention rather than making a
+  request, put the example in a fenced code block; the hook ignores tags inside fences.
 ```
 
 Open the panel manually with `herdr plugin action invoke deetss.review-panel.open`, or bind a
@@ -179,12 +189,14 @@ regenerate it with the hook rather than editing it by hand.
 
 `herdr plugin link .` registers a local checkout for testing without publishing.
 
-**After changing the log format, rebuild release and restart any open panel.** herdr runs
-`target/release/review-panel`, not the debug build, and an already-running panel keeps the
-code it started with. A panel from before the change parses every new line to `None` and
-skips it silently, so the queue looks empty while the log fills up normally - which is
-indistinguishable from the hook not firing. `cargo build --release`, then close and reopen
-the panel.
+**After changing anything under `src/`, rebuild release and restart any open panel.** herdr
+runs `target/release/review-panel`, not the debug build, and an already-running panel keeps
+the code it started with - not just for log-format changes, for any behavior change. A stale
+panel doesn't error, it just silently keeps running whatever it started with, which is
+indistinguishable from the fix never having landed. `scripts/plugin.sh open`/`toggle` now
+checks this itself (`rebuild_if_stale`, dev checkouts only) and rebuilds before opening, but
+a panel that's already open still needs closing and reopening - a rebuild alone does not
+reach a running process.
 
 ## License
 

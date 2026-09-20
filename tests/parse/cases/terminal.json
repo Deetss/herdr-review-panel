@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/Documents/Dylan Vault",
+  "last_assistant_message": "<user_command terminal=\"ssh:jump-host\">sudo systemctl restart nginx</user_command> <user_command step=\"2a\" terminal=\"tmux:main:1\">echo hi</user_command>"
+}

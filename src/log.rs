@@ -1,7 +1,7 @@
 //! Parsing and tailing of `review.log`, written by `scripts/review-notify.sh`.
 //!
 //! Two line formats coexist. v2 (current) is tab-delimited:
-//!   2026-09-09 11:24:32<TAB>session=...<TAB>repo=NAME<TAB>cwd=PATH<TAB>kind=review|command<TAB>[step=LABEL]<TAB>[warn=REASON]<TAB>item=VALUE
+//!   2026-09-09 11:24:32<TAB>session=...<TAB>repo=NAME<TAB>cwd=PATH<TAB>kind=review|command<TAB>[step=LABEL]<TAB>[warn=REASON]<TAB>[terminal=LABEL]<TAB>item=VALUE
 //! v1 (legacy) used spaces as the delimiter. v1 could not represent a value containing a
 //! space, which silently truncated every repo and cwd under a path like "Dylan Vault", and
 //! could not represent a multiline command at all. v2 values are escaped exactly as jq's
@@ -12,6 +12,9 @@
 //! `step=` is only present on commands the reply explicitly ordered (<user_command step="2a">).
 //! `warn=` is only present on commands review-notify.sh's prose heuristic flagged as reading
 //! like a paraphrased task rather than a real shell command.
+//! `terminal=` names which terminal/pane/SSH session a command targets - either an explicit
+//! <user_command terminal="ssh:host"> attribute, or the auto-detected tmux pane when that
+//! attribute is absent. Absent entirely outside tmux with no explicit override.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -28,6 +31,9 @@ pub struct ParsedLine {
     /// Set when review-notify.sh's prose heuristic flagged this command as reading like a
     /// paraphrased task rather than a real shell command (see `warn=` in the module doc).
     pub warn: Option<String>,
+    /// Which terminal/pane/SSH session this targets - explicit override or auto-detected
+    /// tmux pane (see `terminal=` in the module doc).
+    pub terminal: Option<String>,
     /// The decoded value, for display and for opening files.
     pub item: String,
     /// The value exactly as it appears in the log, still escaped. Mark files key off this
@@ -62,6 +68,8 @@ pub enum Row {
         /// Some(reason) when the prose heuristic flagged this command - currently always
         /// "prose" but kept as a string in case other heuristics are added later.
         warn: Option<String>,
+        /// Which terminal/pane/SSH session this targets - see `terminal=` in the module doc.
+        terminal: Option<String>,
         key: String,
     },
 }
@@ -82,7 +90,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
         return None;
     }
     let mut session = String::new();
-    let (mut repo, mut cwd, mut step, mut warn) = (None, None, None, None);
+    let (mut repo, mut cwd, mut step, mut warn, mut terminal) = (None, None, None, None, None);
     let (mut item, mut raw_item) = (None, String::new());
     let mut is_command = false;
     for f in fields {
@@ -100,6 +108,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
             "kind" => is_command = v == "command",
             "step" => step = Some(unescape(v)),
             "warn" => warn = Some(v.to_string()),
+            "terminal" => terminal = Some(unescape(v)),
             "item" => {
                 raw_item = v.to_string();
                 item = Some(unescape(v));
@@ -115,6 +124,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
         is_command,
         step,
         warn,
+        terminal,
         item: item?,
         raw_item,
     })
@@ -143,6 +153,8 @@ fn parse_v1(line: &str) -> Option<ParsedLine> {
         is_command,
         step,
         warn,
+        // v1 predates terminal tagging entirely - every legacy line gets None.
+        terminal: None,
         raw_item: item.clone(),
         item,
     })
@@ -235,6 +247,7 @@ pub fn append_row(
             command: line.item.clone(),
             step: line.step.clone(),
             warn: line.warn.clone(),
+            terminal: line.terminal.clone(),
             key: item_key,
         });
     } else {
@@ -341,6 +354,22 @@ mod tests {
         assert_eq!(parsed.step, None);
         assert_eq!(parsed.warn, None);
         assert_eq!(parsed.item, "herdr-plugin.toml");
+    }
+
+    #[test]
+    fn parses_a_command_line_with_a_terminal_label() {
+        let line = "2026-09-09 12:00:00\tsession=abc\trepo=deetss\tcwd=/home/d\tkind=command\tterminal=ssh:jump-host\titem=sudo systemctl restart nginx";
+        let parsed = parse_line(line).unwrap();
+        assert!(parsed.is_command);
+        assert_eq!(parsed.terminal.as_deref(), Some("ssh:jump-host"));
+        assert_eq!(parsed.item, "sudo systemctl restart nginx");
+    }
+
+    #[test]
+    fn a_line_with_no_terminal_field_parses_to_none() {
+        let line = "2026-09-09 12:00:00\tsession=abc\trepo=deetss\tcwd=/home/d\tkind=command\titem=git status";
+        let parsed = parse_line(line).unwrap();
+        assert_eq!(parsed.terminal, None);
     }
 
     #[test]
@@ -483,10 +512,10 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/review.log");
         let text = std::fs::read_to_string(path).expect("fixture log missing");
         let parsed: Vec<ParsedLine> = text.lines().filter_map(parse_line).collect();
-        assert_eq!(parsed.len(), 6, "every fixture line must parse");
+        assert_eq!(parsed.len(), 7, "every fixture line must parse");
 
         // v2: a path with a space survives intact, which v1 could not do.
-        for p in &parsed[..5] {
+        for p in &parsed[..6] {
             assert_eq!(p.repo, "Dylan Vault");
             assert_eq!(p.cwd.as_deref(), Some("/home/deetss/Documents/Dylan Vault"));
         }
@@ -518,11 +547,16 @@ mod tests {
         assert_eq!(parsed[4].warn.as_deref(), Some("missing"));
         assert_eq!(parsed[4].item, "docs/gone.md");
 
+        // An explicit terminal="..." override survives the round trip.
+        assert_eq!(parsed[5].terminal.as_deref(), Some("ssh:jump-host"));
+        assert_eq!(parsed[5].item, "sudo systemctl restart nginx");
+
         // v1 lines keep parsing alongside v2 ones in the same file.
-        let legacy = &parsed[5];
+        let legacy = &parsed[6];
         assert_eq!(legacy.repo, "deetss");
         assert_eq!(legacy.item, "git status");
         assert!(legacy.is_command);
+        assert_eq!(legacy.terminal, None);
     }
 
     #[test]
@@ -597,6 +631,7 @@ mod tests {
             is_command,
             step: step.map(str::to_string),
             warn: None,
+            terminal: None,
             item: item.to_string(),
             raw_item: item.to_string(),
         }
@@ -657,6 +692,7 @@ mod tests {
             command,
             step,
             warn,
+            terminal,
             key,
         } = &rows[2]
         else {
@@ -665,7 +701,30 @@ mod tests {
         assert_eq!(command, "echo hi");
         assert_eq!(step.as_deref(), Some("2a"));
         assert_eq!(warn, &None);
+        assert_eq!(terminal, &None);
         assert_eq!(key, "t1|s1|echo hi");
+    }
+
+    #[test]
+    fn command_rows_carry_an_explicit_terminal_override() {
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        let cleared = HashSet::new();
+        let mut targeted = line(
+            "t1",
+            "s1",
+            "repo",
+            true,
+            None,
+            "sudo systemctl restart nginx",
+        );
+        targeted.terminal = Some("ssh:jump-host".to_string());
+        append_row(&mut rows, &mut last_key, &targeted, "/home/d", &cleared);
+
+        let Row::CommandItem { terminal, .. } = &rows[2] else {
+            panic!("expected CommandItem")
+        };
+        assert_eq!(terminal.as_deref(), Some("ssh:jump-host"));
     }
 
     #[test]
