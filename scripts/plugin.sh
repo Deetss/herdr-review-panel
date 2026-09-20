@@ -22,10 +22,38 @@ pane="${HERDR_PANE_ID:-}"
 QUEUE_LOG="${REVIEW_PANEL_LOG:-$HOME/.claude/review.log}"
 DONE_LOG="${REVIEW_PANEL_DONE_LOG:-$HOME/.claude/review-done.log}"
 CLEARED_LOG="${REVIEW_PANEL_CLEARED_LOG:-$HOME/.claude/review-cleared.log}"
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$plugin_root/target/release/review-panel"
 
 refuse() {
   printf 'review-panel: %s\n' "$1" >&2
   exit 1
+}
+
+# herdr runs $BIN directly (see herdr-plugin.toml) and an already-open pane keeps whatever
+# code it started with - a rebuild alone does not reach it. Left unchecked this produces the
+# exact bug that motivated this guard: a fix lands in source, nobody rebuilds+restarts, and
+# the panel silently runs stale code with no error (see README's "After changing the log
+# format" note - this generalizes that to every source change, not just log-format ones).
+# Only applies to a dev checkout with source next to it; an install shipping only the
+# compiled binary has nothing here to compare against and is left alone.
+rebuild_if_stale() {
+  [ -d "$plugin_root/src" ] || return 0
+  command -v cargo >/dev/null 2>&1 || return 0
+  local stale=""
+  if [ ! -x "$BIN" ]; then
+    stale=1
+  else
+    stale=$(find "$plugin_root/src" "$plugin_root/Cargo.toml" "$plugin_root/Cargo.lock" \
+      -newer "$BIN" -print -quit 2>/dev/null)
+  fi
+  [ -n "$stale" ] || return 0
+  printf 'review-panel: binary is stale, rebuilding...\n' >&2
+  if ( cd "$plugin_root" && cargo build --release >/dev/null 2>&1 ); then
+    printf 'review-panel: rebuilt\n' >&2
+  else
+    printf 'review-panel: rebuild failed, launching existing binary anyway\n' >&2
+  fi
 }
 
 if [ "$mode" = "clear" ]; then
@@ -128,6 +156,7 @@ open)
     pane=$(printf '%s' "$PANES_JSON" | jq -r '.result.panes[0].pane_id // empty' 2>/dev/null)
   fi
   [ -n "$pane" ] || refuse "no pane to attach to in $ws"
+  rebuild_if_stale
   out=$("$H" plugin pane open --plugin "$PLUGIN_ID" --entrypoint sidebar \
     --placement split --target-pane "$pane" --direction right --no-focus 2>/dev/null) ||
     refuse "herdr plugin pane open failed"

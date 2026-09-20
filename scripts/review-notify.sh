@@ -19,6 +19,28 @@ dbg() {
   printf '%s\n' "$*" >>"$DEBUG_LOG"
 }
 
+# Portable timeout (macOS lacks GNU timeout): poll the child and SIGKILL it after SECONDS.
+# Ported from structupath.browser's lib.sh - same shape, same reasoning. Every call below
+# runs after the log write is already durable (see the comment above that printf), so a
+# kill here only costs a toast/panel-pop/collie-sync side effect, never a queued item.
+with_timeout() {
+  local secs="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$((secs * 10))" ]; then
+      kill -9 "$pid" 2>/dev/null
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$pid" 2>/dev/null
+  return $?
+}
+
 # Single exit point, so every early return still leaves a trace in the debug log.
 # Diagnosing "nothing appeared" used to be impossible because the old hook returned
 # from three different places without recording that it had run at all.
@@ -72,12 +94,13 @@ esc() {
   printf '%s' "$s"
 }
 
-emit() { # kind step warn item(already escaped)
+emit() { # kind step warn item(already escaped) [terminal]
   local line
   printf -v line '%s\tsession=%s\trepo=%s\tcwd=%s\tkind=%s' \
     "$ts" "$session_id" "$repo_esc" "$cwd_esc" "$1"
   [ -n "$2" ] && printf -v line '%s\tstep=%s' "$line" "$2"
   [ -n "$3" ] && printf -v line '%s\twarn=%s' "$line" "$3"
+  [ -n "${5:-}" ] && printf -v line '%s\tterminal=%s' "$line" "$5"
   printf -v line '%s\titem=%s' "$line" "$4"
   lines+=("$line")
   logged=$((logged + 1))
@@ -89,7 +112,7 @@ emit() { # kind step warn item(already escaped)
 }
 
 # The ctx record always comes first, so read it before anything needs $cwd.
-while IFS=$'\t' read -r rtype f1 f2 f3 f4; do
+while IFS=$'\t' read -r rtype f1 f2 f3 f4 f5; do
   case "$rtype" in
     ctx)
       session_id=$(undash "$f1")
@@ -98,10 +121,19 @@ while IFS=$'\t' read -r rtype f1 f2 f3 f4; do
       ts=$(date '+%Y-%m-%d %H:%M:%S')
       repo_esc=$(esc "$repo_name")
       cwd_esc=$(esc "$cwd")
+      # Auto-detected once per invocation (every item in one Stop hook shares the same
+      # terminal), and reused below for the toast label too - one tmux call, not two.
+      # Guarded like the calls below it even though this one runs before the log write,
+      # since it's the one call that could otherwise stall commands from ever reaching disk.
+      auto_terminal=$(with_timeout 1 tmux display-message -p '#S:#I' 2>/dev/null || echo "")
       ;;
     item)
       step=$(undash "$f2")
       warn=$(undash "$f3")
+      # An explicit terminal="..." attribute overrides the auto-detected tmux pane - the
+      # only way to express a target tmux can't see, like a remote SSH host.
+      attr_terminal=$(undash "$f5")
+      term_val="${attr_terminal:-$auto_terminal}"
       if [ "$f1" = "review" ]; then
         # A review target that resolves on disk logs clean; a URL is a legitimate
         # target this convention never anticipated; anything else is logged with
@@ -120,7 +152,7 @@ while IFS=$'\t' read -r rtype f1 f2 f3 f4; do
           warn="${warn:+$warn,}missing"
         fi
       fi
-      emit "$f1" "$step" "$warn" "$f4"
+      emit "$f1" "$step" "$warn" "$f4" "$term_val"
       ;;
     near)
       # Written as kind=command so it lands on the panel arm that already renders the
@@ -150,9 +182,8 @@ fi
 # mid-line.
 printf '%s\n' "${lines[@]}" >>"$LOG"
 
-tmux_loc=$(tmux display-message -p '#S:#I' 2>/dev/null || echo "")
 loc_label="$repo_name"
-[ -n "$tmux_loc" ] && loc_label="$loc_label (tmux $tmux_loc)"
+[ -n "$auto_terminal" ] && loc_label="$loc_label (tmux $auto_terminal)"
 
 # The toast shows the item as logged, so a multiline command appears on one line.
 first_flat=${first//\\n/ }
@@ -170,7 +201,7 @@ tty_path=$(tty 2>/dev/null || echo "")
 if [ -n "$tty_path" ] && [ -w "$tty_path" ]; then
   printf '\033]9;%s\007' "$msg" >"$tty_path"
 fi
-command -v herdr >/dev/null 2>&1 && herdr notification show "Review needed" --body "$msg" --sound request >/dev/null 2>&1
+command -v herdr >/dev/null 2>&1 && with_timeout 2 herdr notification show "Review needed" --body "$msg" --sound request >/dev/null 2>&1
 
 # `herdr plugin action invoke` always targets the globally-focused pane, not this hook's own
 # pane, so it can pop the panel open in whichever tab happens to have UI focus at the moment.
@@ -178,8 +209,13 @@ command -v herdr >/dev/null 2>&1 && herdr notification show "Review needed" --bo
 # hook's own inherited env, which are this session's real pane, so it opens in the right tab.
 # The plugin's install location varies per machine/install method, so resolve it from herdr's
 # own registry rather than hardcoding a path.
+#
+# Every herdr/bash call from here down is wrapped in with_timeout: each runs after the log
+# write above is already durable, so the worst case of a hang is a lost toast/panel-pop/sync
+# with a recorded reason, never an externally-killed hook with no trace (see with_timeout's
+# own comment). Budgets leave headroom inside Claude Code's external 10s hook cap.
 if command -v herdr >/dev/null 2>&1; then
-  plugin_root=$(herdr plugin list --plugin "$PLUGIN_ID" --json 2>/dev/null |
+  plugin_root=$(with_timeout 2 herdr plugin list --plugin "$PLUGIN_ID" --json 2>/dev/null |
     jq -r '.result.plugins[0].plugin_root // empty')
   if [ -z "$plugin_root" ]; then
     # herdr resolves plugin_id from the live manifest, so this only goes empty if the
@@ -188,7 +224,9 @@ if command -v herdr >/dev/null 2>&1; then
     dbg "  panel lookup failed for plugin id '$PLUGIN_ID' - panel not opened"
   else
     plugin_script="$plugin_root/scripts/plugin.sh"
-    [ -x "$plugin_script" ] && bash "$plugin_script" open >/dev/null 2>&1
+    if [ -x "$plugin_script" ]; then
+      with_timeout 4 bash "$plugin_script" open >/dev/null 2>&1 || dbg "  panel open failed or timed out"
+    fi
   fi
 fi
 
@@ -196,7 +234,7 @@ fi
 # click targets cannot work (Collie sends no mouse events). No-ops when Collie is not installed.
 sync_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/collie-sync.sh"
 if [ -x "$sync_script" ]; then
-  bash "$sync_script" >/dev/null 2>&1 || dbg "  collie-sync failed"
+  with_timeout 3 bash "$sync_script" >/dev/null 2>&1 || dbg "  collie-sync failed or timed out"
 fi
 
 finish ok

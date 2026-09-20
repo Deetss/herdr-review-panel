@@ -87,6 +87,7 @@ raw_item=$(field "$found" item)
 cmd=$(unescape "$raw_item")
 step=$(field "$found" step) || step=""
 warn=$(field "$found" warn) || warn=""
+terminal=$(field "$found" terminal) || terminal=""
 cwd=$(unescape "$(field "$found" cwd || printf '%s' "$HOME")")
 session=$(field "$found" session) || session=""
 ts=${found%%	*}
@@ -94,6 +95,9 @@ ts=${found%%	*}
 printf '\n'
 [ -n "$step" ] && printf '  step %s\n' "$step"
 [ -n "$warn" ] && printf '  flagged: %s\n' "$warn"
+# This command was tagged for a specific terminal/pane/SSH session on the desktop - worth
+# surfacing here since running it from the phone runs it here instead, wherever that is.
+[ -n "$terminal" ] && printf '  tagged for: %s\n' "$terminal"
 printf '  in %s\n\n' "$cwd"
 printf '%s\n\n' "$cmd"
 

@@ -5,10 +5,13 @@
 #      two-character sequences and a record can never span lines.
 #
 #   ctx  \t session \t cwd
-#   item \t kind    \t step   \t warn    \t body     -> log it
+#   item \t kind    \t step   \t warn    \t body     \t terminal -> log it
 #   near \t kind    \t reason \t preview            -> log as a warn= row
 #   drop \t kind    \t reason \t body               -> debug only, never logged
 #   stat \t key=value ...                           -> debug only
+#
+# `terminal` is appended last (not inserted after step) so every existing golden fixture
+# only needs a trailing `\t-` rather than a reordering of columns it already asserts on.
 #
 # No side effects, so this is testable standalone:
 #   jq -r -f review-parse.jq < fixture.json
@@ -46,10 +49,21 @@ def dash: if . == "" then "-" else . end;
 
 def step_of($a): ([$a | capture("step\\s*=\\s*\"(?<s>[^\"]*)\"")] | .[0].s) // "";
 
-# Only an empty attribute list or a single well-formed step="..." is a real tag. This one
-# rule is what kills a reply that quotes the parser's own regex: the attrs it captures
-# from `<user_command\b[^>]*>` are `\b[^`, which fails here.
-def attrs_ok($a): $a | test("^\\s*(?:step\\s*=\\s*\"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\"\\s*)?$");
+# The explicit override for auto-detected terminal/pane/ssh-session tagging (see
+# review-notify.sh's auto_terminal). Charset is deliberately looser than step's - values
+# like "ssh:jump-host" or "tmux:main:2" need ":" - but quotes and newlines stay excluded
+# since the value is written straight into a quoted TOML string downstream (collie-sync.sh).
+def terminal_of($a): ([$a | capture("terminal\\s*=\\s*\"(?<t>[^\"\\n]*)\"")] | .[0].t) // "";
+
+def ATTR:
+    "(?:step\\s*=\\s*\"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\""
+  + "|terminal\\s*=\\s*\"[^\"\\n]{1,64}\")";
+
+# Only an empty attribute list, or up to one each of step="..." and terminal="..." in
+# either order, is a real tag. This one rule is what kills a reply that quotes the
+# parser's own regex: the attrs it captures from `<user_command\b[^>]*>` are `\b[^`, which
+# fails here.
+def attrs_ok($a): $a | test("^\\s*(?:" + ATTR + "\\s*){0,2}$");
 
 def shelly($b): $b | test("[/|><$=\"'\\\\`*&;]|\\s-{1,2}[A-Za-z]");
 
@@ -90,7 +104,8 @@ def is_prose($b):
       elif ($body | length) == 0      then ["near", $kind, "empty", ($attrs | dash)]
       elif (EXAMPLES | index($body))  then ["drop", $kind, "example", $body]
       elif $fenced                    then ["drop", $kind, "fenced", $body]
-      else ["item", $kind, (step_of($attrs) | dash), ($warn | dash), ($body[0:MAXLOG])]
+      else ["item", $kind, (step_of($attrs) | dash), ($warn | dash), ($body[0:MAXLOG]),
+              (terminal_of($attrs) | dash)]
       end ),
   # Report only the opens that no match consumed, by offset. Counting opens against
   # matches would re-report tags that parsed fine alongside a genuinely unclosed one.
