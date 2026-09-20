@@ -3,7 +3,7 @@ use crate::cleared;
 use crate::done;
 use crate::log::{self, Row};
 use chrono::Local;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,16 @@ const STATUS_TTL: Duration = Duration::from_millis(1500);
 /// silently fails) can read and select the full command by hand, so this trims the window
 /// they have to do that before it vanishes on its own.
 const DETAIL_TTL: Duration = Duration::from_millis(2500);
+
+/// How long a checked-off command stays in place before relocating to the trailing
+/// "Completed" section - long enough to register as confirmation of the check, short enough
+/// that the queue doesn't stay cluttered with done items.
+const COMPLETE_DELAY: Duration = Duration::from_secs(10);
+
+/// Sentinel repo label for the synthetic trailing GroupHeader that collects completed
+/// commands. Paired with an empty `ts` (real log timestamps are never empty), so this can
+/// never collide with a genuine `(ts, repo)` group.
+const COMPLETED_REPO: &str = "Completed";
 
 /// Column (within the list area, 0-indexed) where a command row's "[ ]"/"[x]" checkbox ends -
 /// a 2-space indent then the 4-char box. Clicks before this column toggle done; clicks at or
@@ -45,6 +55,13 @@ pub struct App {
     last_key: Option<(String, String)>,
     done: HashSet<String>,
     done_path: PathBuf,
+    /// When each done key was checked, so sweep_completed knows when COMPLETE_DELAY has
+    /// elapsed. In-memory only - a restart re-seeds it from done.rs (see with_paths), which
+    /// is fine since a key already done before this run has no real "when" to honor anyway.
+    done_since: HashMap<String, Instant>,
+    /// Keys already relocated into the Completed section, so sweep_completed only ever
+    /// considers newly-eligible ones instead of rescanning everything every tick.
+    completed: HashSet<String>,
     cleared: HashSet<String>,
     cleared_path: PathBuf,
     status: Option<(String, Instant)>,
@@ -85,6 +102,13 @@ impl App {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let done = done::load(&done_path);
+        // Already done before this run started - there's no real "when" for these (done.rs
+        // carries no timestamp), so treat them as already past COMPLETE_DELAY rather than
+        // making the user wait again on every reopen.
+        let done_since = done
+            .iter()
+            .map(|k| (k.clone(), Instant::now() - COMPLETE_DELAY))
+            .collect();
         let cleared = cleared::load(&cleared_path);
         let mut rows = Vec::new();
         let mut last_key = None;
@@ -110,11 +134,14 @@ impl App {
             last_key,
             done,
             done_path,
+            done_since,
+            completed: HashSet::new(),
             cleared,
             cleared_path,
             status: None,
             visible_height: 1,
         };
+        app.sweep_completed();
         app.jump_to_latest();
         app
     }
@@ -134,6 +161,16 @@ impl App {
             &self.cleared,
         );
         self.done = done::load(&self.done_path);
+        // A key can arrive here already done without ever going through this instance's
+        // mark_done - another panel instance, or review-run.sh completing it from the phone
+        // bridge. Same reasoning as with_paths' initial seed: there's no real "when" to honor
+        // from this instance's perspective, so treat it as already elapsed rather than never
+        // sweeping it at all (done_since would otherwise simply have no entry for it, ever).
+        for key in &self.done {
+            self.done_since
+                .entry(key.clone())
+                .or_insert_with(|| Instant::now() - COMPLETE_DELAY);
+        }
         let new_cleared = cleared::load(&self.cleared_path);
         if new_cleared != self.cleared {
             // Someone (another instance, or this panel's own clear-all) dismissed something
@@ -144,12 +181,18 @@ impl App {
                 .retain(|r| row_key(r).is_none_or(|k| !self.cleared.contains(k)));
             self.prune_empty_groups();
         }
-        if self.rows.len() != before {
+        let structural_change = self.rows.len() != before;
+        if structural_change {
             self.jump_to_latest();
-            true
-        } else {
-            false
         }
+        // Independent of the length check above: a sweep relocates rows without changing
+        // how many there are, so it needs its own trigger for the caller to know to redraw
+        // and its own jump_to_latest (idempotent if both fire in the same tick).
+        if self.sweep_completed() {
+            self.jump_to_latest();
+            return true;
+        }
+        structural_change
     }
 
     pub fn is_done(&self, key: &str) -> bool {
@@ -194,6 +237,7 @@ impl App {
     fn mark_done(&mut self, key: &str) {
         if self.done.insert(key.to_string()) {
             done::mark(&self.done_path, key);
+            self.done_since.insert(key.to_string(), Instant::now());
         }
     }
 
@@ -204,6 +248,10 @@ impl App {
             cleared::mark(&self.cleared_path, key);
         }
         self.rows.retain(|r| row_key(r) != Some(key));
+        // Otherwise a cleared-then-forgotten key would sit in these maps forever - harmless
+        // but pointless to keep once the row it describes is gone for good.
+        self.done_since.remove(key);
+        self.completed.remove(key);
     }
 
     /// Drops any GroupHeader (and its preceding Blank separator) left with no items under it
@@ -232,6 +280,44 @@ impl App {
             idx += 1;
             k
         });
+    }
+
+    /// Relocates any command checked off at least COMPLETE_DELAY ago out of its normal
+    /// position into a single trailing "Completed" section. Cheap no-op on an ordinary tick
+    /// (the common case) since it bails before touching `rows` at all when nothing is newly
+    /// eligible. Returns whether anything moved, so the caller knows to redraw/rejump.
+    fn sweep_completed(&mut self) -> bool {
+        let newly_eligible: HashSet<String> = self
+            .done_since
+            .iter()
+            .filter(|(k, at)| !self.completed.contains(*k) && at.elapsed() >= COMPLETE_DELAY)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if newly_eligible.is_empty() {
+            return false;
+        }
+        // Stable partition: both halves keep their original relative order for free, so
+        // rows already sitting in a prior Completed section (kept, since their key is in
+        // `completed` rather than `newly_eligible`) stay exactly where they are.
+        let (kept, moved): (Vec<Row>, Vec<Row>) =
+            std::mem::take(&mut self.rows).into_iter().partition(
+                |r| !matches!(r, Row::CommandItem { key, .. } if newly_eligible.contains(key)),
+            );
+        self.rows = kept;
+        self.prune_empty_groups();
+        let has_completed_header = self.rows.iter().any(
+            |r| matches!(r, Row::GroupHeader { ts, repo } if ts.is_empty() && repo == COMPLETED_REPO),
+        );
+        if !has_completed_header {
+            self.rows.push(Row::Blank);
+            self.rows.push(Row::GroupHeader {
+                ts: String::new(),
+                repo: COMPLETED_REPO.to_string(),
+            });
+        }
+        self.rows.extend(moved);
+        self.completed.extend(newly_eligible);
+        true
     }
 
     fn activatable_rows(&self) -> impl Iterator<Item = usize> + '_ {
@@ -525,6 +611,131 @@ mod tests {
         };
         assert!(f.app.is_done(key));
         assert_eq!(f.app.rows.len(), 3);
+    }
+
+    #[test]
+    fn toggling_done_does_not_immediately_relocate_the_row() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        f.app.poll();
+        // COMPLETE_DELAY hasn't elapsed yet - still Blank, GroupHeader, the one command, no
+        // Completed section.
+        assert_eq!(f.app.rows.len(), 3);
+        assert!(
+            !f.app
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed")),
+            "no Completed section should exist before the delay elapses"
+        );
+    }
+
+    #[test]
+    fn a_command_moves_to_completed_once_the_delay_elapses() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        let key = {
+            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        // No real sleep: back-date the in-memory timer past COMPLETE_DELAY directly.
+        f.app
+            .done_since
+            .insert(key.clone(), Instant::now() - Duration::from_secs(11));
+
+        assert!(f.app.sweep_completed(), "sweep should report a relocation");
+
+        let header_idx = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
+            .expect("expected a Completed header");
+        let moved_idx = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommandItem { key: k, .. } if k == &key))
+            .expect("expected the command row to still exist");
+        assert!(
+            moved_idx > header_idx,
+            "the completed command should sit after the Completed header"
+        );
+        // A second sweep with nothing newly eligible is a no-op, not a duplicate move.
+        assert!(!f.app.sweep_completed());
+    }
+
+    #[test]
+    fn items_already_done_at_load_time_land_in_completed_immediately() {
+        let mut log = tempfile::NamedTempFile::new().unwrap();
+        write!(log, "{}", now_command_line("r", "echo hi")).unwrap();
+        log.flush().unwrap();
+        let done = tempfile::NamedTempFile::new().unwrap();
+        let cleared = tempfile::NamedTempFile::new().unwrap();
+
+        // Mark it done on disk *before* the panel ever loads it - there's no session to have
+        // watched it get checked, so it should skip the waiting period entirely.
+        let key = {
+            let probe = App::with_paths(
+                log.path().to_path_buf(),
+                10,
+                "/home/d".to_string(),
+                done.path().to_path_buf(),
+                cleared.path().to_path_buf(),
+            );
+            let Row::CommandItem { key, .. } = &probe.rows[probe.cursor.unwrap()] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        done::mark(&done.path().to_path_buf(), &key);
+
+        let app = App::with_paths(
+            log.path().to_path_buf(),
+            10,
+            "/home/d".to_string(),
+            done.path().to_path_buf(),
+            cleared.path().to_path_buf(),
+        );
+        let header_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
+            .expect("expected a Completed header on load");
+        let moved_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommandItem { key: k, .. } if k == &key))
+            .expect("expected the command row to exist");
+        assert!(moved_idx > header_idx);
+    }
+
+    #[test]
+    fn clearing_the_completed_header_clears_every_item_under_it() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        let key = {
+            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        f.app
+            .done_since
+            .insert(key, Instant::now() - Duration::from_secs(11));
+        f.app.sweep_completed();
+
+        let header_idx = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
+            .unwrap();
+        f.app.cursor = Some(header_idx);
+        f.app.clear_cursor();
+        assert!(f.app.rows.is_empty());
     }
 
     #[test]
