@@ -33,6 +33,13 @@ def TAG_RE:
 
 def FENCE_RE: "(?<f>```|~~~).*?\\k<f>";
 
+# A reply naming the tag in prose rather than issuing it - `<user_command>` sitting alone
+# inside a single-backtick code span, per CLAUDE.md's own convention for referring to the
+# tag by name. Distinct from a real command wrapped in backticks (CLAUDE.md's "wrap a
+# literal command in a single backtick"): there the backtick sits outside the tags and a
+# body separates open from close, so this never matches one.
+def BARE_MENTION_RE: "`<user_(?:command|review)\\b[^>]{0,40}>`";
+
 # CLAUDE.md's own illustrative bodies. A reply quoting the convention is documentation,
 # not a request. Exact match only, deliberately narrow, so a real command is never hit.
 def EXAMPLES: ["the command", "path/to/file", "some shell command", "the file", "cmd", "command"];
@@ -84,6 +91,7 @@ def is_prose($b):
 . as $p
 | (($p.last_assistant_message // "")) as $msg
 | ([$msg | match(FENCE_RE; "gm") | {s: .offset, e: (.offset + .length)}]) as $fences
+| ([$msg | match(BARE_MENTION_RE; "gm") | {s: .offset, e: (.offset + .length)}]) as $bare
 | ([$msg | match(TAG_RE; "gm")]) as $ms
 | ([$msg | match("<user_(?:command|review)\\b"; "g")] | length) as $opens
 | ([$msg | match("</user_(?:command|review)>"; "g")] | length) as $closes
@@ -113,6 +121,7 @@ def is_prose($b):
       | match("<user_(?:command|review)\\b[^>]{0,40}>[^\\n]{0,60}"; "g")
       | . as $o
       | select( any($ms[]; $o.offset >= .offset and $o.offset < (.offset + .length)) | not )
+      | select( any($bare[]; $o.offset >= .s and $o.offset < .e) | not )
       | $o.string ][0:MAXNEAR][]
     | ["near", "tag", "unclosed", .] ),
   ["stat", "opens=\($opens)", "closes=\($closes)", "matched=\($ms|length)",
