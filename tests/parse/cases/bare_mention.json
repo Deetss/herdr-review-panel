@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/work",
+  "last_assistant_message": "That just means the container hasn't started yet - the monitor fired before you ran the `<user_command>`. Whenever you run it, let me know and I'll watch for the new errors."
+}
