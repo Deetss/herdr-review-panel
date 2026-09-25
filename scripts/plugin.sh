@@ -19,9 +19,11 @@ H="${HERDR_BIN_PATH:-herdr}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-deetss.review-panel}"
 ws="${HERDR_WORKSPACE_ID:-}"
 pane="${HERDR_PANE_ID:-}"
-QUEUE_LOG="${REVIEW_PANEL_LOG:-$HOME/.claude/review.log}"
-DONE_LOG="${REVIEW_PANEL_DONE_LOG:-$HOME/.claude/review-done.log}"
-CLEARED_LOG="${REVIEW_PANEL_CLEARED_LOG:-$HOME/.claude/review-cleared.log}"
+# shellcheck source=pane-paths.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pane-paths.sh"
+QUEUE_LOG="${REVIEW_PANEL_LOG:-$(pane_scoped_path "")}"
+DONE_LOG="${REVIEW_PANEL_DONE_LOG:-$(pane_scoped_path "-done")}"
+CLEARED_LOG="${REVIEW_PANEL_CLEARED_LOG:-$(pane_scoped_path "-cleared")}"
 plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$plugin_root/target/release/review-panel"
 
@@ -157,8 +159,14 @@ open)
   fi
   [ -n "$pane" ] || refuse "no pane to attach to in $ws"
   rebuild_if_stale
+  # Explicit --env, not inherited environment: QUEUE_LOG/DONE_LOG/CLEARED_LOG above were
+  # computed from *this* invocation's pane context, which is what should be scoped, not
+  # whatever the spawned process would otherwise pick up on its own.
   out=$("$H" plugin pane open --plugin "$PLUGIN_ID" --entrypoint sidebar \
-    --placement split --target-pane "$pane" --direction right --no-focus 2>/dev/null) ||
+    --placement split --target-pane "$pane" --direction right --no-focus \
+    --env "REVIEW_PANEL_LOG=$QUEUE_LOG" \
+    --env "REVIEW_PANEL_DONE_LOG=$DONE_LOG" \
+    --env "REVIEW_PANEL_CLEARED_LOG=$CLEARED_LOG" 2>/dev/null) ||
     refuse "herdr plugin pane open failed"
   opened=$(printf '%s' "$out" | jq -r '.result.plugin_pane.pane.pane_id // empty' 2>/dev/null)
   printf 'opened review panel %s in %s\n' "${opened:-pane}" "$ws"

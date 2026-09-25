@@ -7,8 +7,11 @@
 # stdin->stdout function with golden tests (tests/parse/), and the quoting hazards that
 # used to live here (grep -oP per tag, then sed to strip the tag) are gone with it.
 
-parser="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/review-parse.jq"
-LOG="${REVIEW_PANEL_LOG:-$HOME/.claude/review.log}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+parser="$script_dir/review-parse.jq"
+# shellcheck source=pane-paths.sh
+source "$script_dir/pane-paths.sh"
+LOG="${REVIEW_PANEL_LOG:-$(pane_scoped_path "")}"
 DEBUG="${REVIEW_NOTIFY_DEBUG:-0}"
 DEBUG_LOG="${REVIEW_NOTIFY_DEBUG_LOG:-$HOME/.claude/review-debug.log}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-deetss.review-panel}"
