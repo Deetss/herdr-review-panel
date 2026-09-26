@@ -1,6 +1,6 @@
-//! Closing the panel and opening a flagged file both reuse scripts/plugin.sh rather than
-//! reimplementing that logic here - it's the same code path the tools-menu keybinding and
-//! `herdr plugin action invoke` already use, so there's one place that knows how to do each.
+//! Closing the panel, opening a flagged file, and notifying the agent all reuse
+//! scripts/plugin.sh rather than reimplementing that logic here, so there's one place that
+//! knows how to do each.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -8,7 +8,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn plugin_sh() -> Option<String> {
-    std::env::var("HERDR_PLUGIN_ROOT")
+    std::env::var("REVIEW_PANEL_ROOT")
         .ok()
         .map(|root| format!("{root}/scripts/plugin.sh"))
 }
@@ -21,6 +21,8 @@ pub fn close() {
     let _ = Command::new("bash")
         .arg(script)
         .arg("close")
+        // Tells plugin.sh's Orca branch this is the panel's own pane (see its comment).
+        .env("REVIEW_PANEL_SELF_CLOSE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -31,6 +33,20 @@ pub fn clear_all() {
     let _ = Command::new("bash")
         .arg(script)
         .arg("clear")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Tells the agent that flagged these items to continue, via `orca terminal send` - see
+/// plugin.sh's `notify` mode.
+pub fn notify_agent(target: &str, text: &str) {
+    let Some(script) = plugin_sh() else { return };
+    let _ = Command::new("bash")
+        .arg(script)
+        .arg("notify")
+        .env("REVIEW_PANEL_NOTIFY_TARGET", target)
+        .env("REVIEW_PANEL_NOTIFY_TEXT", text)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -65,14 +81,14 @@ pub fn open_item(abspath: &str) -> Opener {
     let Ok(output) = Command::new("bash")
         .arg(script)
         .arg("open-item")
-        .env("HERDR_PLUGIN_CLICKED_URL", format!("file://{abspath}"))
+        .env("REVIEW_PANEL_CLICKED_URL", format!("file://{abspath}"))
         .output()
     else {
         return Opener::Unknown;
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     match stdout.trim().rsplit("opener=").next() {
-        Some("code") => Opener::Editor,
+        Some("code") | Some("orca") => Opener::Editor,
         Some("xdg-open") | Some("explorer") => Opener::Fallback,
         _ => Opener::Unknown,
     }

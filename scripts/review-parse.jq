@@ -59,7 +59,7 @@ def step_of($a): ([$a | capture("step\\s*=\\s*\"(?<s>[^\"]*)\"")] | .[0].s) // "
 # The explicit override for auto-detected terminal/pane/ssh-session tagging (see
 # review-notify.sh's auto_terminal). Charset is deliberately looser than step's - values
 # like "ssh:jump-host" or "tmux:main:2" need ":" - but quotes and newlines stay excluded
-# since the value is written straight into a quoted TOML string downstream (collie-sync.sh).
+# so the value always stays one well-formed field in the queue log.
 def terminal_of($a): ([$a | capture("terminal\\s*=\\s*\"(?<t>[^\"\\n]*)\"")] | .[0].t) // "";
 
 def ATTR:
