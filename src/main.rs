@@ -12,6 +12,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use ratatui::DefaultTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,11 +27,18 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
+    let notify_target = std::env::var("REVIEW_PANEL_NOTIFY_TARGET").ok();
 
-    let mut app = App::new(log_path, window_minutes);
+    let mut app = App::new(log_path, window_minutes, notify_target);
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    // The pane title is how plugin.sh finds an open panel; without this the pane keeps the
+    // shell's own title.
+    execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        SetTitle("Review Queue")
+    )?;
     let result = run(&mut terminal, &mut app);
     execute!(std::io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
@@ -47,6 +55,16 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
+                // The finished-queue prompt swallows every key but its own three, so a stray
+                // Space/Backspace can't act on a row underneath while it's up.
+                Event::Key(key) if app.report_prompt_active() => match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        app.confirm_report_success();
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => app.confirm_report_error(),
+                    KeyCode::Esc => app.dismiss_report_prompt(),
+                    _ => {}
+                },
                 // The detail overlay swallows the key that dismisses it, so Esc does not also
                 // close the whole panel on the way out.
                 Event::Key(key) if app.detail_text().is_some() => match key.code {
@@ -63,7 +81,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     KeyCode::Backspace | KeyCode::Delete => app.clear_cursor(),
                     // Shifted, because clearing everything from a stray keypress is not
                     // recoverable. The mouse route has a dedicated button; this is its only
-                    // keyboard equivalent, which is what Collie needs since it sends no mouse.
+                    // keyboard equivalent, which keyboard-only remote clients need.
                     KeyCode::Char('C') => app.click_clear_all(),
                     KeyCode::Esc | KeyCode::Char('q') => app.click_close(),
                     _ => {}
@@ -72,7 +90,9 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     if let Some(areas) = &areas {
                         let (col, row) = (mouse.column, mouse.row);
                         match mouse.kind {
-                            MouseEventKind::Down(MouseButton::Left) => {
+                            MouseEventKind::Down(MouseButton::Left)
+                                if !app.report_prompt_active() =>
+                            {
                                 if within(areas.close, col, row) {
                                     app.click_close();
                                 } else if within(areas.clear_all, col, row) {
