@@ -1,26 +1,24 @@
 # Review Queue
 
-A [Herdr](https://herdr.dev) plugin that gives Claude Code (or any other coding agent) a way to
-hand things back to you instead of doing them itself: files worth a look, and commands only
-you should run. Flag either in a reply and they show up in a split panel you can click, copy,
-check off, and clear.
+A review panel for [Orca](https://www.onorca.dev) that gives Claude Code (or any other coding
+agent) a way to hand things back to you instead of doing them itself: files worth a look, and
+commands only you should run. Flag either in a reply and they show up in a split panel you can
+click, copy, check off, and clear.
 
 ```
-                                                                                clear  x
-Click a file/command, its box to check off, or the x on any row/section to clear it.
+click: open/copy · box: done · x: clear                                       clear  x
 ─────────────────────────────────────────────────────────────────────────────────────
-
-2026-09-09 13:23:33  my-project
-  sudo apt update && sudo apt install -y fail2ban                                    x
-  [ ] 2a. sudo systemctl enable --now fail2ban                                       x
-  [x] echo "ok" >> ~/.ssh/authorized_keys                                            x
+13:23  my-project                                                                   x
+      /home/me/my-project/etc/fail2ban/jail.local                                   x
+  [ ] 2a. sudo systemctl enable --now fail2ban                                      x
+  [x] echo "ok" >> ~/.ssh/authorized_keys                                           x
 ```
 
 ## Why
 
 Agents sometimes need to tell you "go look at this file" or "run this command yourself" -
 things they shouldn't do unattended (destructive commands, credentials, anything you want
-eyes on first). Saying it in prose gets lost in a long reply. This plugin gives that request
+eyes on first). Saying it in prose gets lost in a long reply. This panel gives that request
 a durable, actionable home: a panel that pops open the moment it happens, stays until you deal
 with it, and survives long after the reply that created it has scrolled away.
 
@@ -39,8 +37,12 @@ replies:
   tmux is tagged automatically with its pane (`tmux display-message -p '#S:#I'`); outside
   tmux with no explicit `terminal=`, it carries no location at all.
 
-Matches get logged to `~/.claude/review.log` and the panel pops open automatically. The panel
-itself is a small Rust + [ratatui](https://ratatui.rs) app - real mouse and keyboard handling,
+Matches get logged to a queue scoped to the Orca tab they came from (`ORCA_TAB_ID`, under
+`~/.claude/review/`), and the panel pops open automatically as an `orca terminal split` to the
+right of the pane that flagged the item, then hands focus back to it. The panel is found again
+by its pane title (`Review Queue`, which the binary sets itself), so `open` is idempotent and
+`close`/`toggle` work from the panel's own `x`. The panel itself is a small Rust +
+[ratatui](https://ratatui.rs) app - real mouse and keyboard handling,
 not a hand-rolled terminal escape-code parser (an earlier bash version tried that and it broke
 in ways that were hard to reproduce and fix).
 
@@ -57,10 +59,13 @@ the wrong closing tag, `unclosed` for an open tag with no terminator, `missing` 
 target that does not resolve on disk, `prose` for a "command" that reads like a paraphrased
 task, `truncated` for an over-long body.
 
-Every subprocess call `review-notify.sh` makes after the log write - the toast, the panel
-pop, the Collie phone sync - runs under a `with_timeout` guard, so a hung `herdr` call or a
-stalled Tailscale sync costs only that one side effect (logged to the debug log) instead of
-Claude Code externally killing the whole hook at its own 10s budget with no trace.
+Every subprocess call `review-notify.sh` makes after the log write - the `notify-send` toast
+and the panel pop - runs under a `with_timeout` guard, so a hung `orca` call costs only that
+one side effect (logged to the debug log) instead of Claude Code externally killing the whole
+hook at its own 10s budget with no trace.
+
+When you're done with a group (or the whole queue), the panel tells the agent that flagged it
+to continue, via `orca terminal send`, so nobody has to go back and prompt it by hand.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
 reply) and read `~/.claude/review-debug.log`.
@@ -69,7 +74,7 @@ reply) and read `~/.claude/review-debug.log`.
 
 | Action | Mouse | Keyboard |
 |---|---|---|
-| Open a file / copy a command | Click its text | `Enter` |
+| Open a file / copy a command (copying also checks it off) | Click its text | `Enter` |
 | Check a command off | Click its checkbox | `Space` or `d` |
 | Clear one row | Click the `x` on its row | `Backspace`/`Delete` |
 | Clear a whole section | Click the `x` on its header | `Backspace`/`Delete` on the header |
@@ -78,49 +83,25 @@ reply) and read `~/.claude/review-debug.log`.
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
 
 Checking a command off keeps it visible, struck through. Clearing removes it entirely. Both
-persist across restarts (`~/.claude/review-done.log`, `~/.claude/review-cleared.log`) and sync
-live across multiple open panel instances.
+persist across restarts and sync live across multiple open panel instances.
 
-## On a phone (Collie)
+A clicked file opens in Orca's editor (`orca file open`) when it lives inside the current
+worktree, and falls back to VS Code, then `xdg-open` on its directory, otherwise.
 
-[Collie](https://github.com/herdr-dev/collie) serves a mobile web UI for your herd over
-Tailscale. It has no terminal emulator: it strips ANSI server-side, renders the pane grid as
-text, and **sends no mouse events at all**. So the panel's click targets cannot work there,
-and no amount of changing this plugin will make them.
+## On a phone
 
-Two things bridge the gap.
-
-**The panel is keyboard-drivable.** Collie's Keys tray already ships a fixed keyboard with the
-arrows, Enter, Space, Escape and Backspace, which cover navigate / activate / mark done /
-close / clear one row. Only "clear the whole queue" needed a key, and it is `C` — shifted,
-because there is no undo. `collie-keys.toml.example` puts it on a labelled button; read its
-header first, because an unscoped row replaces the shipped presets on every pane.
-
-Activating a command row also opens it full-screen. On the desktop that is alongside the
-clipboard copy; on a phone it is the only way to read a long command, since OSC-52 cannot
-reach a phone through a UI that strips ANSI.
-
-**Queued commands become launcher rows.** `scripts/collie-sync.sh` runs at the end of every
-hook invocation and mirrors the queue into Collie's `launchers.toml`, so each queued command
-is a button on the phone's Launch section. It rewrites only the block between its own markers;
-rows you wrote by hand are preserved. Items already checked off or cleared on the desktop drop
-out, and running one from the phone marks it done, so the two surfaces agree.
-
-Every row points at `scripts/review-run.sh <id>`, never at the command itself. That is
-deliberate. `launchers.toml` is the allowlist `POST /api/launch` matches against and it
-accepts no confirm option, so putting agent-proposed commands in it directly would make
-anything the agent suggested one tap from running over Tailscale with no reading step — the
-opposite of what `<user_command>` is for. Instead the allowlist holds only a fixed wrapper
-invocation; the id resolves against `review.log` locally, the real command is printed, and it
-runs only after an explicit `y`.
-
-Set `REVIEW_PANEL_COLLIE_ROWS` to change how many rows are mirrored (default 12). Collie picks
-up edits live, but you need to reload the page to see them.
+Orca Mobile mirrors terminals, so the panel is already on your phone. It is fully
+keyboard-drivable for clients without a mouse: arrows, Enter, Space, Escape and Backspace
+cover navigate / activate / mark done / close / clear one row, and `C` clears the whole
+queue (shifted, because there is no undo). Activating a command row also opens it
+full-screen, which is the only way to read a long command where OSC-52 clipboard copy
+cannot reach.
 
 ## Install
 
 ```bash
-herdr plugin install Deetss/herdr-review-panel
+git clone https://github.com/Deetss/herdr-review-panel.git ~/dev/personal/herdr-review-panel
+cd ~/dev/personal/herdr-review-panel && cargo build --release
 ```
 
 Then wire up the hook. Add a `Stop` and `SubagentStop` hook to your Claude Code settings
@@ -143,29 +124,23 @@ Finally add the tag conventions to your `CLAUDE.md` so the agent knows to use th
 - Wrap any file you want reviewed in <user_review>path/to/file</user_review>.
 - Wrap any command you should run yourself in <user_command>the command</user_command>
   (add step="N" for ordered steps, and terminal="ssh:host" when it targets somewhere other
-  than wherever you're about to click it - a plain <user_command> auto-tags with the current
-  tmux pane instead). Write both tags wrapped in a single backtick so they render as code
-  instead of raw text. Close each tag with its own name - closing with </parameter> is the
-  most common way an item gets dropped. When describing the convention rather than making a
-  request, put the example in a fenced code block; the hook ignores tags inside fences.
+  than wherever you're about to click it). Write both tags wrapped in a single backtick so
+  they render as code instead of raw text. Close each tag with its own name - closing with
+  </parameter> is the most common way an item gets dropped. When describing the convention
+  rather than making a request, put the example in a fenced code block; the hook ignores tags
+  inside fences.
 ```
 
-Open the panel manually with `herdr plugin action invoke deetss.review-panel.open`, or bind a
-key to it in your Herdr `config.toml`:
-
-```toml
-[[keys.command]]
-key = "prefix+r"
-type = "plugin_action"
-command = "deetss.review-panel.open"
-```
+Open, close or toggle the panel by hand from any Orca terminal with `scripts/plugin.sh open`
+(or `close` / `toggle`). The scripts call `orca-ide`, or `$ORCA_CLI_COMMAND` when set, and never
+a bare `orca`: outside an Orca terminal that name resolves to the GNOME screen reader.
 
 ## Development
 
-Requires a Rust toolchain (stable) and [Herdr](https://herdr.dev) `>= 0.8.0`.
+Requires a Rust toolchain (stable) and [Orca](https://www.onorca.dev) for the live panel.
 
 ```bash
-cargo build --release   # produces target/release/review-panel, which herdr-plugin.toml runs
+cargo build --release   # produces target/release/review-panel, which plugin.sh launches
 cargo test              # unit tests covering log parsing/grouping and app state
 cargo clippy --all-targets -- -D warnings
 cargo fmt
@@ -187,10 +162,8 @@ never commit it.
 only thing pinning jq's `@tsv` escaping to the Rust `unescape` that decodes it, so
 regenerate it with the hook rather than editing it by hand.
 
-`herdr plugin link .` registers a local checkout for testing without publishing.
-
-**After changing anything under `src/`, rebuild release and restart any open panel.** herdr
-runs `target/release/review-panel`, not the debug build, and an already-running panel keeps
+**After changing anything under `src/`, rebuild release and restart any open panel.** The
+panel runs `target/release/review-panel`, not the debug build, and an already-running panel keeps
 the code it started with - not just for log-format changes, for any behavior change. A stale
 panel doesn't error, it just silently keeps running whatever it started with, which is
 indistinguishable from the fix never having landed. `scripts/plugin.sh open`/`toggle` now

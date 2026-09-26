@@ -1,15 +1,16 @@
 # Sourced by review-notify.sh and plugin.sh: scope the review-queue log/done/cleared
-# files to the herdr pane they're running in, so each pane gets its own queue instead of
-# one machine-wide shared log. HERDR_PANE_ID is the same env var in both scripts' cases -
-# review-notify.sh inherits it from the Stop hook's own pane, and plugin.sh either inherits
-# it the same way (review-notify.sh execs it directly) or gets it injected by herdr as the
-# focused pane when an action/keybind triggers `open` some other way (see herdr-plugin.toml's
-# `contexts = ["pane", "workspace"]`). Falls back to the original unscoped path when there's
-# no pane context at all (e.g. run outside herdr), so this is a no-op for anyone not using it.
+# files to the Orca tab they're running in, so each tab gets its own queue instead of one
+# machine-wide shared log. review-notify.sh inherits ORCA_TAB_ID from the Stop hook's own
+# pane, and plugin.sh inherits it the same way (review-notify.sh execs it directly).
+#
+# The scope is the tab, not the terminal: the sidebar is a split in the same tab, so the tab
+# is what a flag and the panel that shows it have in common, and a tab id survives Orca's
+# session restore where a terminal handle may not. Falls back to the unscoped path outside
+# Orca, so this is a no-op there.
 #
 # $1: "" for the main log, "-done" or "-cleared" for the companion files.
 pane_scoped_path() {
-  local pane_id="${HERDR_PANE_ID:-}"
+  local pane_id="${ORCA_TAB_ID:-}"
   if [ -n "$pane_id" ]; then
     local dir="$HOME/.claude/review"
     mkdir -p "$dir" 2>/dev/null

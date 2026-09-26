@@ -7,6 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 const CLEAR_ALL_LABEL: &str = "clear";
+/// Content starts here on every item row, so paths and commands share one left edge and the
+/// eye scans one column. Six is the checkbox's own width ("  [ ] "), see CHECKBOX_END_COL.
+const FILE_INDENT: &str = "      ";
 
 /// Screen regions the caller needs for mouse hit-testing - rendering owns layout, so it's the
 /// one place that knows where things actually ended up.
@@ -18,8 +21,9 @@ pub struct Areas {
 
 pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     let area = frame.area();
-    let [close_area, hint_area, divider_area, list_area] = Layout::vertical([
-        Constraint::Length(1),
+    // The hint shares the top row with the buttons: in a 45-column split every row of chrome
+    // is a row of queue the user cannot see.
+    let [close_area, divider_area, list_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
@@ -56,13 +60,27 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         clear_all_button,
     );
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "Click a file/command, its box to check off, or the x on any row/section to clear it.",
-            theme::dim(),
-        )),
-        hint_area,
-    );
+    // The hint doubles as the mode indicator: the detail view (or the report prompt) replaces
+    // the list below it, and its own key line scrolls out of sight on a long command.
+    let hint = if app.report_prompt_active() {
+        "report? \u{b7} y: yes \u{b7} e: error \u{b7} Esc: not yet"
+    } else if app.detail_text().is_some() {
+        "full command \u{b7} Esc/Enter: back"
+    } else {
+        "click: open/copy \u{b7} box: done \u{b7} x: clear"
+    };
+    // Whatever is left of the row after the buttons and a two-column gap; a narrower pane
+    // just loses the hint's tail rather than colliding with `clear`.
+    let hint_width = clear_all_button.x.saturating_sub(2 + close_area.x);
+    let hint_area = Rect {
+        x: close_area.x,
+        y: close_area.y,
+        width: hint_width,
+        height: 1,
+    };
+    // Drop whole segments rather than cutting mid-word: "box: done · x:" teaches nothing.
+    let hint = fit_hint(hint, hint_width as usize);
+    frame.render_widget(Paragraph::new(Span::styled(hint, theme::dim())), hint_area);
 
     let divider = "\u{2500}".repeat(divider_area.width as usize);
     frame.render_widget(
@@ -79,7 +97,14 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         .take(visible)
         .map(|(idx, row)| render_row(row, Some(idx) == app.cursor, app, list_area.width))
         .collect();
-    frame.render_widget(Paragraph::new(lines), list_area);
+    if app.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("Nothing to review.", theme::dim())),
+            list_area,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(lines), list_area);
+    }
 
     // Transient click feedback ("Opened x", "Copied to clipboard") overlays the bottom-right
     // corner rather than living in the static hint row, so it reads as a toast confirming the
@@ -98,7 +123,9 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         );
     }
 
-    if let Some(command) = app.detail_text() {
+    if app.report_prompt_active() {
+        render_report_prompt(frame, list_area);
+    } else if let Some(command) = app.detail_text() {
         render_detail(frame, list_area, command);
     }
 
@@ -110,7 +137,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
 }
 
 /// Full-width, wrapped view of one command. The panel's normal rows are single-line and
-/// truncate, and a phone viewing this through Collie gets no clipboard and no horizontal
+/// truncate, and a phone viewing this remotely gets no clipboard and no horizontal
 /// scroll, so a long command is otherwise unreadable there. Real newlines are restored -
 /// unlike the list rows, which flatten them to a marker to stay one line tall.
 fn render_detail(frame: &mut Frame, area: Rect, command: &str) {
@@ -128,17 +155,103 @@ fn render_detail(frame: &mut Frame, area: Rect, command: &str) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
+/// Shown once every command in the queue is checked off, before anything gets reported back
+/// to the agent - checking a box only means it was run, not that it worked, so this is where
+/// the human says which.
+fn render_report_prompt(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled("Finished the review queue.", theme::header())),
+        Line::default(),
+        Line::from("Report to the agent?"),
+        Line::default(),
+        Line::from(Span::styled("y", theme::header())),
+        Line::from("  yes, it all worked - continue"),
+        Line::from(Span::styled("e", theme::header())),
+        Line::from("  no, something went wrong - flag it instead"),
+        Line::from(Span::styled("Esc", theme::header())),
+        Line::from("  not yet - leave the queue as is"),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Which end of a row's content to drop when it does not fit: a path keeps its tail (the
+/// filename is what identifies it), a command keeps its head (the verb is).
+#[derive(Clone, Copy)]
+enum Trim {
+    Head,
+    Tail,
+}
+
 /// Appends right-padding plus a trailing "x" to reach `width` - the per-row/per-section clear
 /// affordance app.rs's click_row treats any click on the rightmost column as. Only called for
 /// row kinds that are actually clearable (not Blank).
-fn with_clear_glyph(mut spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
-    let content_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+///
+/// The last span is the row's content and is cut to fit first: ratatui clips a too-long line
+/// at the right edge, which used to take the "x" with it, leaving the rightmost click meaning
+/// "clear" on a row that showed no clear glyph. Narrow splits (Orca's is half a tab) hit this
+/// on almost every absolute path.
+fn with_clear_glyph(mut spans: Vec<Span<'static>>, width: u16, trim: Trim) -> Vec<Span<'static>> {
     let last_col = (width as usize).saturating_sub(1);
+    // One column of gap before the x, so a full row still reads as content-then-glyph.
+    let budget = last_col.saturating_sub(1);
+    let prefix_len: usize = spans
+        .iter()
+        .take(spans.len().saturating_sub(1))
+        .map(|s| s.content.chars().count())
+        .sum();
+    if let Some(last) = spans.last_mut() {
+        let room = budget.saturating_sub(prefix_len);
+        if last.content.chars().count() > room {
+            let fitted = fit(&last.content, room, trim);
+            *last = Span::styled(fitted, last.style);
+        }
+    }
+    let content_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     if last_col > content_len {
         spans.push(Span::raw(" ".repeat(last_col - content_len)));
     }
     spans.push(Span::styled("x", theme::clear_icon()));
     spans
+}
+
+/// Keeps as many " \u{b7} "-separated segments of `hint` as fit in `room` columns.
+fn fit_hint(hint: &str, room: usize) -> String {
+    let mut out = String::new();
+    for seg in hint.split(" \u{b7} ") {
+        let candidate = if out.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{out} \u{b7} {seg}")
+        };
+        if candidate.chars().count() > room {
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
+fn fit(text: &str, room: usize, trim: Trim) -> String {
+    let len = text.chars().count();
+    if len <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let keep = room - 1;
+    match trim {
+        Trim::Tail => {
+            let mut head: String = text.chars().take(keep).collect();
+            head.push('\u{2026}');
+            head
+        }
+        Trim::Head => {
+            let tail: String = text.chars().skip(len - keep).collect();
+            format!("\u{2026}{tail}")
+        }
+    }
 }
 
 fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'static> {
@@ -155,11 +268,14 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             // and its gap rather than rendering a blank-then-double-space.
             let mut spans = Vec::new();
             if !ts.is_empty() {
-                spans.push(Span::styled(ts.clone(), theme::dim()));
+                // The list is a window of the last few minutes, so the date is always today
+                // and only the clock part tells groups apart.
+                let clock = ts.get(11..16).unwrap_or(ts.as_str()).to_string();
+                spans.push(Span::styled(clock, theme::dim()));
                 spans.push(Span::raw("  "));
             }
             spans.push(Span::styled(repo.clone(), repo_style));
-            Line::from(with_clear_glyph(spans, width))
+            Line::from(with_clear_glyph(spans, width, Trim::Tail))
         }
         Row::FileItem {
             label,
@@ -177,12 +293,12 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             } else {
                 theme::close_button() // plain yellow, no underline - not a real link
             };
-            let mut spans = vec![Span::raw("  ")];
+            let mut spans = vec![Span::raw(FILE_INDENT)];
             if warn.is_some() {
                 spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
             }
             spans.push(Span::styled(text, style));
-            Line::from(with_clear_glyph(spans, width))
+            Line::from(with_clear_glyph(spans, width, Trim::Head))
         }
         Row::CommandItem {
             command,
@@ -222,7 +338,56 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
                 command.replace('\n', " \u{23ce} "),
                 text_style,
             ));
-            Line::from(with_clear_glyph(spans, width))
+            Line::from(with_clear_glyph(spans, width, Trim::Tail))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn short_row_pads_out_to_the_glyph() {
+        let spans = with_clear_glyph(vec![Span::raw("ab")], 6, Trim::Tail);
+        assert_eq!(text(&spans), "ab   x");
+    }
+
+    #[test]
+    fn long_path_keeps_its_tail_and_the_glyph() {
+        let spans = with_clear_glyph(
+            vec![Span::raw("  "), Span::raw("/a/b/c/file.md")],
+            10,
+            Trim::Head,
+        );
+        assert_eq!(text(&spans), "  \u{2026}le.md x");
+    }
+
+    #[test]
+    fn long_command_keeps_its_head_and_the_glyph() {
+        let spans = with_clear_glyph(
+            vec![Span::raw("[ ] "), Span::raw("echo hello world")],
+            12,
+            Trim::Tail,
+        );
+        assert_eq!(text(&spans), "[ ] echo \u{2026} x");
+    }
+
+    #[test]
+    fn hint_drops_whole_segments() {
+        let hint = "click: open/copy \u{b7} box: done \u{b7} x: clear";
+        assert_eq!(fit_hint(hint, 100), hint);
+        assert_eq!(fit_hint(hint, 30), "click: open/copy \u{b7} box: done");
+        assert_eq!(fit_hint(hint, 10), "");
+    }
+
+    #[test]
+    fn exact_fit_is_left_alone() {
+        let spans = with_clear_glyph(vec![Span::raw("abcd")], 6, Trim::Tail);
+        assert_eq!(text(&spans), "abcd x");
     }
 }

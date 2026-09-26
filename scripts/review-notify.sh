@@ -14,7 +14,8 @@ source "$script_dir/pane-paths.sh"
 LOG="${REVIEW_PANEL_LOG:-$(pane_scoped_path "")}"
 DEBUG="${REVIEW_NOTIFY_DEBUG:-0}"
 DEBUG_LOG="${REVIEW_NOTIFY_DEBUG_LOG:-$HOME/.claude/review-debug.log}"
-PLUGIN_ID="${HERDR_PLUGIN_ID:-deetss.review-panel}"
+# Never bare `orca`: outside an Orca terminal it resolves to the GNOME screen reader.
+ORCA="${ORCA_CLI_COMMAND:-${ORCA_BIN:-orca-ide}}"
 
 # Off costs one string compare - no forks, no date, no stat.
 dbg() {
@@ -25,7 +26,7 @@ dbg() {
 # Portable timeout (macOS lacks GNU timeout): poll the child and SIGKILL it after SECONDS.
 # Ported from structupath.browser's lib.sh - same shape, same reasoning. Every call below
 # runs after the log write is already durable (see the comment above that printf), so a
-# kill here only costs a toast/panel-pop/collie-sync side effect, never a queued item.
+# kill here only costs a toast or panel-pop side effect, never a queued item.
 with_timeout() {
   local secs="$1"
   shift
@@ -204,40 +205,18 @@ tty_path=$(tty 2>/dev/null || echo "")
 if [ -n "$tty_path" ] && [ -w "$tty_path" ]; then
   printf '\033]9;%s\007' "$msg" >"$tty_path"
 fi
-command -v herdr >/dev/null 2>&1 && with_timeout 2 herdr notification show "Review needed" --body "$msg" --sound request >/dev/null 2>&1
-
-# `herdr plugin action invoke` always targets the globally-focused pane, not this hook's own
-# pane, so it can pop the panel open in whichever tab happens to have UI focus at the moment.
-# Run the plugin script directly instead: it reads HERDR_WORKSPACE_ID/HERDR_PANE_ID from this
-# hook's own inherited env, which are this session's real pane, so it opens in the right tab.
-# The plugin's install location varies per machine/install method, so resolve it from herdr's
-# own registry rather than hardcoding a path.
-#
-# Every herdr/bash call from here down is wrapped in with_timeout: each runs after the log
-# write above is already durable, so the worst case of a hang is a lost toast/panel-pop/sync
-# with a recorded reason, never an externally-killed hook with no trace (see with_timeout's
-# own comment). Budgets leave headroom inside Claude Code's external 10s hook cap.
-if command -v herdr >/dev/null 2>&1; then
-  plugin_root=$(with_timeout 2 herdr plugin list --plugin "$PLUGIN_ID" --json 2>/dev/null |
-    jq -r '.result.plugins[0].plugin_root // empty')
-  if [ -z "$plugin_root" ]; then
-    # herdr resolves plugin_id from the live manifest, so this only goes empty if the
-    # plugin was uninstalled or the manifest id changed. Worth a debug line either way:
-    # the old code swallowed it and the panel just silently never opened.
-    dbg "  panel lookup failed for plugin id '$PLUGIN_ID' - panel not opened"
-  else
-    plugin_script="$plugin_root/scripts/plugin.sh"
-    if [ -x "$plugin_script" ]; then
-      with_timeout 4 bash "$plugin_script" open >/dev/null 2>&1 || dbg "  panel open failed or timed out"
-    fi
-  fi
+if command -v notify-send >/dev/null 2>&1; then
+  with_timeout 2 notify-send "Review needed" "$msg" >/dev/null 2>&1
 fi
 
-# Mirror the queue into Collie's launcher rows so it is usable from a phone, where the panel's
-# click targets cannot work (Collie sends no mouse events). No-ops when Collie is not installed.
-sync_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/collie-sync.sh"
-if [ -x "$sync_script" ]; then
-  with_timeout 3 bash "$sync_script" >/dev/null 2>&1 || dbg "  collie-sync failed or timed out"
+# plugin.sh lives next to this script and opens the sidebar as an Orca terminal split in
+# this hook's own tab. It runs after the log write above is already durable, so the worst
+# case of a hang is a lost panel-pop with a recorded reason, never an externally-killed hook
+# with no trace (see with_timeout's own comment). Three orca CLI calls fit comfortably inside
+# Claude Code's external 10s hook cap.
+if [ -n "${ORCA_TERMINAL_HANDLE:-}" ] && command -v "$ORCA" >/dev/null 2>&1; then
+  open_out=$(with_timeout 6 bash "$script_dir/plugin.sh" open 2>&1 </dev/null) ||
+    dbg "  orca panel open failed or timed out: ${open_out//$'\n'/ | }"
 fi
 
 finish ok
