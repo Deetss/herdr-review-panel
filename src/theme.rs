@@ -42,20 +42,25 @@ pub fn command_done() -> Style {
         .add_modifier(Modifier::CROSSED_OUT)
 }
 
+/// The checkbox is a control, not content: gray keeps it from competing with the command
+/// text beside it, and "[ ]" vs "[x]" carries the done state on its own.
 pub fn checkbox() -> Style {
-    Style::default().fg(Color::Magenta)
+    Style::default().fg(Color::Gray)
 }
 
 pub fn checkbox_highlighted() -> Style {
     Style::default()
-        .fg(Color::Magenta)
+        .fg(Color::Gray)
         .add_modifier(Modifier::REVERSED)
 }
 
+/// The toast overlays the last list row, so it must read as something other than a row:
+/// bold cyan is the header family, never used on an item. No ITALIC, which several
+/// terminals drop, and no DIM, which made it vanish on dark backgrounds.
 pub fn status() -> Style {
     Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::DIM | Modifier::ITALIC)
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn header() -> Style {
@@ -76,11 +81,12 @@ pub fn clear_icon() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
 }
 
-/// Leading marker on a command review-notify.sh's prose heuristic flagged - always plain
-/// amber/bold, regardless of hover state, same reasoning as `clear_icon`.
+/// Leading marker on a command review-notify.sh's prose heuristic flagged - always bold and
+/// regardless of hover state, same reasoning as `clear_icon`. Light red rather than yellow
+/// so it is not the same color as the file rows it sits beside.
 pub fn warn_icon() -> Style {
     Style::default()
-        .fg(Color::Yellow)
+        .fg(Color::LightRed)
         .add_modifier(Modifier::BOLD)
 }
 
