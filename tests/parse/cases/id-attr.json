@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "listen <user_review id=\"audio-ab\">/tmp/a/listen2</user_review> and <user_command step=\"1\" id=\"run\" terminal=\"ssh:box\">ls</user_command>"
+}
