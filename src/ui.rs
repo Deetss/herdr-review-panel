@@ -17,10 +17,20 @@ pub struct Areas {
     pub close: Rect,
     pub clear_all: Rect,
     pub list: Rect,
+    /// The prompt's y / e / Esc options, in that order, while the finish prompt is up.
+    pub report: Option<[Rect; 3]>,
 }
 
 pub fn draw(frame: &mut Frame, app: &App) -> Areas {
-    let area = frame.area();
+    let raw_area = frame.area();
+    // Orca overlays its own close/action buttons in the pane's top-right corner;
+    // inset so our close/clear controls don't sit under them.
+    let area = Rect {
+        x: raw_area.x,
+        y: raw_area.y + 1,
+        width: raw_area.width.saturating_sub(1),
+        height: raw_area.height.saturating_sub(1),
+    };
     // The hint shares the top row with the buttons: in a 45-column split every row of chrome
     // is a row of queue the user cannot see.
     let [close_area, divider_area, list_area] = Layout::vertical([
@@ -65,7 +75,10 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     let hint = if app.report_prompt_active() {
         "report? \u{b7} y: yes \u{b7} e: error \u{b7} Esc: not yet"
     } else if app.detail_text().is_some() {
-        "full command \u{b7} Esc/Enter: back"
+        match app.detail_title() {
+            "path" => "full path (copied) \u{b7} Esc/Enter: back",
+            _ => "full command \u{b7} Esc/Enter: back",
+        }
     } else {
         "click: open/copy \u{b7} box: done \u{b7} x: clear"
     };
@@ -123,16 +136,18 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         );
     }
 
+    let mut report = None;
     if app.report_prompt_active() {
-        render_report_prompt(frame, list_area);
+        report = Some(render_report_prompt(frame, list_area));
     } else if let Some(command) = app.detail_text() {
-        render_detail(frame, list_area, command);
+        render_detail(frame, list_area, app.detail_title(), command);
     }
 
     Areas {
         close: close_button,
         clear_all: clear_all_button,
         list: list_area,
+        report,
     }
 }
 
@@ -140,10 +155,10 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
 /// truncate, and a phone viewing this remotely gets no clipboard and no horizontal
 /// scroll, so a long command is otherwise unreadable there. Real newlines are restored -
 /// unlike the list rows, which flatten them to a marker to stay one line tall.
-fn render_detail(frame: &mut Frame, area: Rect, command: &str) {
+fn render_detail(frame: &mut Frame, area: Rect, title: &str, command: &str) {
     frame.render_widget(Clear, area);
     let mut lines = vec![
-        Line::from(Span::styled("command", theme::header())),
+        Line::from(Span::styled(title.to_string(), theme::header())),
         Line::default(),
     ];
     lines.extend(command.lines().map(|l| Line::from(l.to_string())));
@@ -158,21 +173,40 @@ fn render_detail(frame: &mut Frame, area: Rect, command: &str) {
 /// Shown once every command in the queue is checked off, before anything gets reported back
 /// to the agent - checking a box only means it was run, not that it worked, so this is where
 /// the human says which.
-fn render_report_prompt(frame: &mut Frame, area: Rect) {
+fn render_report_prompt(frame: &mut Frame, area: Rect) -> [Rect; 3] {
     frame.render_widget(Clear, area);
-    let lines = vec![
+    const OPTIONS: [(&str, &str); 3] = [
+        ("y", "  yes, it all worked - continue"),
+        ("e", "  no, something went wrong - flag it instead"),
+        ("Esc", "  not yet - leave the queue as is"),
+    ];
+    let mut lines = vec![
         Line::from(Span::styled("Finished the review queue.", theme::header())),
         Line::default(),
         Line::from("Report to the agent?"),
         Line::default(),
-        Line::from(Span::styled("y", theme::header())),
-        Line::from("  yes, it all worked - continue"),
-        Line::from(Span::styled("e", theme::header())),
-        Line::from("  no, something went wrong - flag it instead"),
-        Line::from(Span::styled("Esc", theme::header())),
-        Line::from("  not yet - leave the queue as is"),
     ];
+    let mut rects = [Rect::default(); 3];
+    let mut y = area.y + lines.len() as u16;
+    for (rect, (key, text)) in rects.iter_mut().zip(OPTIONS) {
+        // A description that wraps on a narrow split pushes every later option down with it.
+        let height = 1
+            + (text.chars().count() as u16)
+                .div_ceil(area.width.max(1))
+                .max(1);
+        *rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height,
+        }
+        .intersection(area);
+        y += height;
+        lines.push(Line::from(Span::styled(key, theme::header())));
+        lines.push(Line::from(text));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    rects
 }
 
 /// Which end of a row's content to drop when it does not fit: a path keeps its tail (the
@@ -306,6 +340,7 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             warn,
             terminal,
             key,
+            ..
         } => {
             let done = app.is_done(key);
             let checkbox = if done { "[x] " } else { "[ ] " };
@@ -349,6 +384,25 @@ mod tests {
 
     fn text(spans: &[Span<'static>]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn report_options_sit_on_their_key_lines() {
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut rects = [Rect::default(); 3];
+        terminal
+            .draw(|f| rects = render_report_prompt(f, f.area()))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for (rect, key) in rects.iter().zip(["y", "e", "Esc"]) {
+            let line: String = (0..key.len() as u16)
+                .map(|dx| buf[(rect.x + dx, rect.y)].symbol().to_string())
+                .collect();
+            assert_eq!(line, key);
+            assert_eq!(rect.height, 2);
+        }
     }
 
     #[test]
