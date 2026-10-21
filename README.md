@@ -135,6 +135,27 @@ Open, close or toggle the panel by hand from any Orca terminal with `scripts/plu
 (or `close` / `toggle`). The scripts call `orca-ide`, or `$ORCA_CLI_COMMAND` when set, and never
 a bare `orca`: outside an Orca terminal that name resolves to the GNOME screen reader.
 
+## Watcher panes
+
+`scripts/orca-pane` opens agent watchers (subagent transcript tails and similar) in one
+right-hand column per Orca tab. `orca terminal split` has no size or position options and
+halves whatever pane it targets, so naive callers shrink the main pane to a sliver.
+
+```bash
+orca-pane watch --label <name> -- <command...>
+orca-pane list
+orca-pane close <label|all>
+```
+
+The first watcher splits the agent pane side by side. Later watchers split the newest
+watcher top/bottom. At `ORCA_PANE_MAX` watchers (default 3) the oldest is interrupted and
+reused. The command runs as `<command>; exit`, so the pane closes when it ends, and dead
+handles are pruned before every decision. State lives in
+`${XDG_STATE_HOME:-~/.local/state}/orca-pane/<tab-id>.json`. Outside Orca it does nothing.
+
+The Review Queue sidebar stays its own split in `plugin.sh`. It is a persistent panel with
+its own per-tab dedupe and close-on-exit, not a watcher, so it does not count toward the cap.
+
 ## Development
 
 Requires a Rust toolchain (stable) and [Orca](https://www.onorca.dev) for the live panel.
@@ -146,6 +167,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 
 ./tests/parse/run.sh    # golden tests for the jq tag parser
+./tests/orca-pane/run.sh # orca-pane layout tests against a fake orca-ide
 ./tests/parse/corpus.sh # replays real transcripts, compares against the old parser
 ```
 
