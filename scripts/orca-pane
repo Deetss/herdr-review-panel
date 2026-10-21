@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# orca-pane: lay out agent watcher panes in one right-hand column per Orca tab.
+#
+#   orca-pane watch --label <name> -- <command...>
+#   orca-pane list
+#   orca-pane close <label|all>
+#
+# The first watcher splits the main pane side by side. Later watchers split the newest
+# watcher top/bottom, so the main pane keeps its width. At ORCA_PANE_MAX watchers the
+# oldest is reused instead of splitting again. Outside Orca this exits 0 silently.
+set -u
+
+[ -n "${ORCA_TERMINAL_HANDLE:-}" ] || exit 0
+
+ORCA="${ORCA_CLI_COMMAND:-orca-ide}"
+MAX="${ORCA_PANE_MAX:-3}"
+tab="${ORCA_TAB_ID:-default}"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/orca-pane"
+state="$state_dir/$tab.json"
+mkdir -p "$state_dir"
+
+die() { printf 'orca-pane: %s\n' "$1" >&2; exit 1; }
+
+load_state() {
+  if [ -s "$state" ] && jq -e . "$state" >/dev/null 2>&1; then
+    cat "$state"
+  else
+    jq -n --arg m "$ORCA_TERMINAL_HANDLE" '{main: $m, watchers: []}'
+  fi
+}
+
+# Drops watchers whose handle is no longer a live terminal. If the list call fails the
+# state is kept as is, so a hiccup never forgets panes that are still open.
+prune() {
+  local in live
+  in=$(cat)
+  live=$("$ORCA" terminal list --json 2>/dev/null | jq -c '[.result.terminals[]?.handle]' 2>/dev/null)
+  if [ -z "$live" ]; then
+    printf '%s' "$in"
+    return
+  fi
+  printf '%s' "$in" | jq --argjson live "$live" '.watchers |= map(select(.handle as $h | $live | index($h)))'
+}
+
+save() { jq -c . >"$state"; }
+
+split_pane() { # target direction command -> new handle on stdout
+  local target=$1 dir=$2 cmd=$3 out attempt=0
+  # A split issued right after a pane closes can fail while the layout settles.
+  until out=$("$ORCA" terminal split --terminal "$target" --direction "$dir" --command "$cmd" --json 2>&1); do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 3 ] || die "split failed: $(printf '%s' "$out" | head -c 200)"
+    sleep 1.5
+  done
+  printf '%s' "$out" | jq -er '.result.split.handle' 2>/dev/null || die "split returned no handle"
+}
+
+cmd_watch() {
+  local label="" cmd="" arg
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --label) label=${2:-}; shift 2 ;;
+    --) shift; break ;;
+    *) die "watch: unexpected argument $1" ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "watch: no command given"
+  [ -n "$label" ] || label=$1
+  for arg in "$@"; do printf -v cmd '%s%q ' "$cmd" "$arg"; done
+  cmd="${cmd% }; exit"
+
+  local s count handle
+  s=$(load_state | prune)
+  count=$(printf '%s' "$s" | jq '.watchers | length')
+
+  if [ "$count" -ge "$MAX" ]; then
+    handle=$(printf '%s' "$s" | jq -r '.watchers[0].handle')
+    "$ORCA" terminal send --terminal "$handle" --interrupt >/dev/null 2>&1
+    sleep "${ORCA_PANE_SETTLE:-0.3}"
+    "$ORCA" terminal send --terminal "$handle" --text "$cmd" --enter >/dev/null 2>&1 || die "send to $handle failed"
+    s=$(printf '%s' "$s" | jq --arg l "$label" '.watchers |= (.[1:] + [.[0] | .label = $l])')
+  else
+    local target dir
+    if [ "$count" -eq 0 ]; then
+      target=$ORCA_TERMINAL_HANDLE
+      dir=vertical
+    else
+      target=$(printf '%s' "$s" | jq -r '.watchers[-1].handle')
+      dir=horizontal
+    fi
+    handle=$(split_pane "$target" "$dir" "$cmd") || exit 1
+    "$ORCA" terminal rename --terminal "$handle" --title "$label" >/dev/null 2>&1
+    s=$(printf '%s' "$s" | jq --arg h "$handle" --arg l "$label" '.watchers += [{handle: $h, label: $l}]')
+  fi
+
+  printf '%s' "$s" | save
+  # The split takes focus; hand it back to the agent pane.
+  "$ORCA" terminal switch --terminal "$ORCA_TERMINAL_HANDLE" >/dev/null 2>&1
+  printf 'watching %s in %s\n' "$label" "$handle"
+}
+
+cmd_list() {
+  load_state | prune | jq -r '.watchers[] | "\(.label)\t\(.handle)"'
+}
+
+cmd_close() {
+  local which=${1:-} s h
+  [ -n "$which" ] || die "close: need a label or 'all'"
+  s=$(load_state | prune)
+  for h in $(printf '%s' "$s" | jq -r --arg w "$which" '.watchers[] | select($w == "all" or .label == $w) | .handle'); do
+    "$ORCA" terminal close --terminal "$h" >/dev/null 2>&1
+  done
+  printf '%s' "$s" | jq --arg w "$which" '.watchers |= map(select($w != "all" and .label != $w))' | save
+}
+
+mode=${1:-}
+[ $# -eq 0 ] || shift
+case $mode in
+watch) cmd_watch "$@" ;;
+list) cmd_list ;;
+close) cmd_close "$@" ;;
+*) die "usage: orca-pane watch --label <name> -- <command...> | list | close <label|all>" ;;
+esac
