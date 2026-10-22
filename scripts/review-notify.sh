@@ -98,13 +98,14 @@ esc() {
   printf '%s' "$s"
 }
 
-emit() { # kind step warn item(already escaped) [terminal]
+emit() { # kind step warn item(already escaped) [terminal] [id]
   local line
   printf -v line '%s\tsession=%s\trepo=%s\tcwd=%s\tkind=%s' \
     "$ts" "$session_id" "$repo_esc" "$cwd_esc" "$1"
   [ -n "$2" ] && printf -v line '%s\tstep=%s' "$line" "$2"
   [ -n "$3" ] && printf -v line '%s\twarn=%s' "$line" "$3"
   [ -n "${5:-}" ] && printf -v line '%s\tterminal=%s' "$line" "$5"
+  [ -n "${6:-}" ] && printf -v line '%s\tid=%s' "$line" "$6"
   printf -v line '%s\titem=%s' "$line" "$4"
   lines+=("$line")
   logged=$((logged + 1))
@@ -116,7 +117,7 @@ emit() { # kind step warn item(already escaped) [terminal]
 }
 
 # The ctx record always comes first, so read it before anything needs $cwd.
-while IFS=$'\t' read -r rtype f1 f2 f3 f4 f5; do
+while IFS=$'\t' read -r rtype f1 f2 f3 f4 f5 f6; do
   case "$rtype" in
     ctx)
       session_id=$(undash "$f1")
@@ -156,7 +157,7 @@ while IFS=$'\t' read -r rtype f1 f2 f3 f4 f5; do
           warn="${warn:+$warn,}missing"
         fi
       fi
-      emit "$f1" "$step" "$warn" "$f4" "$term_val"
+      emit "$f1" "$step" "$warn" "$f4" "$term_val" "$(undash "$f6")"
       ;;
     near)
       # Written as kind=command so it lands on the panel arm that already renders the
@@ -215,8 +216,12 @@ fi
 # with no trace (see with_timeout's own comment). Three orca CLI calls fit comfortably inside
 # Claude Code's external 10s hook cap.
 if [ -n "${ORCA_TERMINAL_HANDLE:-}" ] && command -v "$ORCA" >/dev/null 2>&1; then
-  open_out=$(with_timeout 6 bash "$script_dir/plugin.sh" open 2>&1 </dev/null) ||
-    dbg "  orca panel open failed or timed out: ${open_out//$'\n'/ | }"
+  # Detached: opening the split takes seconds of Orca CLI round trips, and the turn should
+  # not wait on them. A failure still lands in the debug log.
+  setsid -f bash -c '
+    out=$(timeout 15 bash "$1" open 2>&1 </dev/null) ||
+      { [ "$2" = "0" ] || printf "  orca panel open failed or timed out: %s\n" "$(printf "%s" "$out" | tr "\n" " ")" >>"$3"; }
+  ' _ "$script_dir/plugin.sh" "$DEBUG" "$DEBUG_LOG" >/dev/null 2>&1 </dev/null
 fi
 
 finish ok

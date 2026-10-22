@@ -37,6 +37,14 @@ replies:
   tmux is tagged automatically with its pane (`tmux display-message -p '#S:#I'`); outside
   tmux with no explicit `terminal=`, it carries no location at all.
 
+Either tag takes `id="name"` (letters, digits, `.`, `_`, `-`, up to 32). A later item in the
+same session with the same id **replaces** the earlier one, so an agent that regenerates a
+file or revises a command swaps the stale row instead of stacking a second one. An exact
+repeat of the same kind and value from the same session replaces too, with no id needed.
+The log stays append-only; replacement happens as rows are built, so a restart converges on
+the same view. Clicking a file row opens it, copies its full path, and shows the path in the
+detail overlay, since a narrow pane only has room for the tail.
+
 Matches get logged to a queue scoped to the Orca tab they came from (`ORCA_TAB_ID`, under
 `~/.claude/review/`), and the panel pops open automatically as an `orca terminal split` to the
 right of the pane that flagged the item, then hands focus back to it. The panel is found again
@@ -64,8 +72,10 @@ and the panel pop - runs under a `with_timeout` guard, so a hung `orca` call cos
 one side effect (logged to the debug log) instead of Claude Code externally killing the whole
 hook at its own 10s budget with no trace.
 
-When you're done with a group (or the whole queue), the panel tells the agent that flagged it
-to continue, via `orca terminal send`, so nobody has to go back and prompt it by hand.
+When you're done with a group (or the whole queue), the panel asks whether it all went well
+and, on "yes," tells the agent that flagged it to continue via `orca terminal send`, so
+nobody has to go back and prompt it by hand. The top `clear` button wipes the queue without
+telling the agent anything at all.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
 reply) and read `~/.claude/review-debug.log`.
@@ -80,6 +90,7 @@ reply) and read `~/.claude/review-debug.log`.
 | Clear a whole section | Click the `x` on its header | `Backspace`/`Delete` on the header |
 | Clear everything | Click `clear` (top) | - |
 | Close the panel | Click `x` (top) | `Esc` or `q` |
+| Clear does not notify the agent - it only wipes the queue. Confirming the finished queue does. | - | - |
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
 
 Checking a command off keeps it visible, struck through. Clearing removes it entirely. Both
@@ -121,7 +132,9 @@ emitted, and nobody noticed because both halves looked fine on their own.
 Finally add the tag conventions to your `CLAUDE.md` so the agent knows to use them:
 
 ```markdown
-- Wrap any file you want reviewed in <user_review>path/to/file</user_review>.
+- Wrap any file you want reviewed in <user_review>/absolute/path/to/file</user_review>, always
+  the full absolute path. Add id="short-name" to an item you may re-flag, so the new one
+  replaces the old one in the queue instead of stacking beside it.
 - Wrap any command you should run yourself in <user_command>the command</user_command>
   (add step="N" for ordered steps, and terminal="ssh:host" when it targets somewhere other
   than wherever you're about to click it). Write both tags wrapped in a single backtick so

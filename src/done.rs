@@ -1,5 +1,8 @@
-//! Tracks which flagged commands have been marked complete. One-way (no unmarking) and
-//! append-only, same philosophy as review.log itself - `plugin.sh clear` truncates both.
+//! Tracks which flagged commands have been marked complete. Marking is append-only, same
+//! philosophy as review.log itself - `plugin.sh clear` truncates both. Unmarking (the
+//! checkbox's undo, before an item sweeps into Completed - see App::unmark_done) has no
+//! append-only representation, so it rewrites the whole file from the set with that key
+//! removed instead.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -27,5 +30,48 @@ pub fn mark(path: &PathBuf, key: &str) {
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{key}");
+    }
+}
+
+pub fn unmark(path: &PathBuf, key: &str) {
+    let mut set = load(path);
+    if !set.remove(key) {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    else {
+        return;
+    };
+    for remaining in &set {
+        let _ = writeln!(file, "{remaining}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmark_removes_only_the_given_key() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        mark(&path, "a");
+        mark(&path, "b");
+        unmark(&path, "a");
+        let remaining = load(&path);
+        assert_eq!(remaining, HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn unmark_of_an_absent_key_is_a_noop() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        mark(&path, "a");
+        unmark(&path, "does-not-exist");
+        assert_eq!(load(&path), HashSet::from(["a".to_string()]));
     }
 }

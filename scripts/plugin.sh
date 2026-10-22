@@ -142,6 +142,12 @@ fi
 # close. A pane `terminal close` just ended stays listed for a while with connected=false,
 # hence the check.
 tab="${ORCA_TAB_ID:-}"
+# Hook runs are detached, so two can overlap. Without this, both list the tab before either
+# split exists, see nothing open, and each opens a pane. Held until this script exits.
+lock_dir="$HOME/.claude/review"
+mkdir -p "$lock_dir" 2>/dev/null
+exec 9>"$lock_dir/${tab//:/_}.open.lock"
+flock -w 12 9 || true
 EXISTING=$("$ORCA" terminal list --json 2>/dev/null |
   jq -r --arg tab "$tab" '.result.terminals[] | select(.title == "Review Queue" and .connected == true and ($tab == "" or .tabId == $tab)) | .handle' 2>/dev/null)
 
@@ -178,12 +184,10 @@ open)
     exit 0
   fi
   rebuild_if_stale
-  # --command is typed into the split's shell, which outlives the sidebar, so the pane is
-  # closed by the shell once the binary exits: that covers q, Esc, the x, and a crash
-  # alike. $ORCA_TERMINAL_HANDLE is left for that shell to expand, as it names the split
-  # pane itself. REVIEW_PANEL_ROOT is how the binary finds this script.
-  printf -v launch 'REVIEW_PANEL_ROOT=%q REVIEW_PANEL_LOG=%q REVIEW_PANEL_DONE_LOG=%q REVIEW_PANEL_CLEARED_LOG=%q REVIEW_PANEL_NOTIFY_TARGET=%q %q; %q terminal close --terminal "$ORCA_TERMINAL_HANDLE" >/dev/null 2>&1' \
-    "$plugin_root" "$QUEUE_LOG" "$DONE_LOG" "$CLEARED_LOG" "$ORCA_TERMINAL_HANDLE" "$BIN" "$ORCA"
+  # --command is typed into the split's shell, so the line stays short: run-panel.sh derives
+  # the rest, runs the binary, and closes the pane when it exits. The leading `clear` wipes
+  # the typed line as soon as it runs, leaving the pane blank until it closes.
+  printf -v launch 'clear; bash %q %q' "$plugin_root/scripts/run-panel.sh" "$ORCA_TERMINAL_HANDLE"
   # "vertical" is Orca's name for side-by-side (the divider is vertical); horizontal stacks.
   # A split issued within a second or two of a pane closing in the same tab fails with
   # "Timed out waiting for split pane handle" while the layout settles; the same call
@@ -196,11 +200,12 @@ open)
   done
   opened=$(printf '%s' "$out" | jq -r '.result.split.handle // empty' 2>/dev/null)
   [ -n "$opened" ] || refuse "orca terminal split returned no handle"
-  "$ORCA" terminal rename --terminal "$opened" --title "Review Queue" >/dev/null 2>&1
+  # Both calls cost a few hundred ms of CLI startup and don't depend on each other.
+  "$ORCA" terminal rename --terminal "$opened" --title "Review Queue" >/dev/null 2>&1 &
   # The split takes focus; give it back to the pane that flagged the item. `focus` isn't
-  # a real orca terminal subcommand (only `switch` is) - this silently no-op'd before,
-  # which is why the panel kept stealing focus on open despite this line existing.
-  "$ORCA" terminal switch --terminal "$ORCA_TERMINAL_HANDLE" >/dev/null 2>&1
+  # a real orca terminal subcommand (only `switch` is).
+  "$ORCA" terminal switch --terminal "$ORCA_TERMINAL_HANDLE" >/dev/null 2>&1 &
+  wait
   printf 'opened review panel %s in this tab\n' "$opened"
   ;;
 *)

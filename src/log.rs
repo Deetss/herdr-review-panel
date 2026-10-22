@@ -12,6 +12,11 @@
 //! `step=` is only present on commands the reply explicitly ordered (<user_command step="2a">).
 //! `warn=` is only present on commands review-notify.sh's prose heuristic flagged as reading
 //! like a paraphrased task rather than a real shell command.
+//! `id=` is an optional agent-chosen name for the item (<user_review id="audio-ab">). A later
+//! item in the same session with the same id replaces the earlier one in the panel, and so
+//! does an exact repeat of the same kind and value with no id. The log itself stays
+//! append-only; replacement happens as rows are built, so a restart's backfill converges on
+//! the same view.
 //! `terminal=` names which terminal/pane/SSH session a command targets - either an explicit
 //! <user_command terminal="ssh:host"> attribute, or the auto-detected tmux pane when that
 //! attribute is absent. Absent entirely outside tmux with no explicit override.
@@ -34,6 +39,8 @@ pub struct ParsedLine {
     /// Which terminal/pane/SSH session this targets - explicit override or auto-detected
     /// tmux pane (see `terminal=` in the module doc).
     pub terminal: Option<String>,
+    /// Agent-chosen name that lets a later item replace this one (see `id=` in the module doc).
+    pub id: Option<String>,
     /// The decoded value, for display and for opening files.
     pub item: String,
     /// The value exactly as it appears in the log, still escaped. Mark files key off this
@@ -60,6 +67,8 @@ pub enum Row {
         /// did not resolve on disk, which used to be dropped silently instead of shown.
         warn: Option<String>,
         key: String,
+        /// Identity across re-flags: a newer row with the same slot replaces this one.
+        slot: String,
     },
     /// `key` identifies this exact log entry for the done-marks and cleared-marks files.
     CommandItem {
@@ -71,6 +80,8 @@ pub enum Row {
         /// Which terminal/pane/SSH session this targets - see `terminal=` in the module doc.
         terminal: Option<String>,
         key: String,
+        /// Identity across re-flags: a newer row with the same slot replaces this one.
+        slot: String,
     },
 }
 
@@ -91,6 +102,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
     }
     let mut session = String::new();
     let (mut repo, mut cwd, mut step, mut warn, mut terminal) = (None, None, None, None, None);
+    let mut id = None;
     let (mut item, mut raw_item) = (None, String::new());
     let mut is_command = false;
     for f in fields {
@@ -109,6 +121,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
             "step" => step = Some(unescape(v)),
             "warn" => warn = Some(v.to_string()),
             "terminal" => terminal = Some(unescape(v)),
+            "id" => id = Some(v.to_string()),
             "item" => {
                 raw_item = v.to_string();
                 item = Some(unescape(v));
@@ -125,6 +138,7 @@ fn parse_v2(line: &str) -> Option<ParsedLine> {
         step,
         warn,
         terminal,
+        id,
         item: item?,
         raw_item,
     })
@@ -155,6 +169,7 @@ fn parse_v1(line: &str) -> Option<ParsedLine> {
         warn,
         // v1 predates terminal tagging entirely - every legacy line gets None.
         terminal: None,
+        id: None,
         raw_item: item.clone(),
         item,
     })
@@ -233,6 +248,23 @@ pub fn append_row(
         // since it would then look like a header was already emitted when it wasn't.
         return;
     }
+    // Replace whatever this item supersedes before deciding about a group header: removing
+    // a group's last row prunes its header, so the header decision below must see that.
+    let slot = match &line.id {
+        Some(id) => format!("{}|id|{id}", line.session),
+        None => format!(
+            "{}|{}|{}",
+            line.session,
+            if line.is_command { "command" } else { "review" },
+            line.raw_item
+        ),
+    };
+    let before = rows.len();
+    rows.retain(|r| row_slot(r) != Some(slot.as_str()));
+    if rows.len() != before {
+        prune_empty_groups(rows);
+        *last_key = None;
+    }
     let is_new_group = last_key.as_ref() != Some(&key);
     if is_new_group {
         rows.push(Row::Blank);
@@ -249,6 +281,7 @@ pub fn append_row(
             warn: line.warn.clone(),
             terminal: line.terminal.clone(),
             key: item_key,
+            slot,
         });
     } else {
         let abspath = resolve_abspath(&line.item, line.cwd.as_deref(), home);
@@ -257,8 +290,44 @@ pub fn append_row(
             abspath,
             warn: line.warn.clone(),
             key: item_key,
+            slot,
         });
     }
+}
+
+fn row_slot(row: &Row) -> Option<&str> {
+    match row {
+        Row::FileItem { slot, .. } | Row::CommandItem { slot, .. } => Some(slot),
+        Row::Blank | Row::GroupHeader { .. } => None,
+    }
+}
+
+/// Drops any GroupHeader (and its preceding Blank separator) left with no items under it,
+/// so removing or dismissing every item in a section does not leave an orphaned
+/// timestamp/repo line with nothing beneath it.
+pub fn prune_empty_groups(rows: &mut Vec<Row>) {
+    let mut keep = vec![true; rows.len()];
+    for i in 0..rows.len() {
+        if !matches!(rows[i], Row::GroupHeader { .. }) {
+            continue;
+        }
+        let has_items = rows[i + 1..]
+            .iter()
+            .take_while(|r| !matches!(r, Row::Blank | Row::GroupHeader { .. }))
+            .any(|r| matches!(r, Row::FileItem { .. } | Row::CommandItem { .. }));
+        if !has_items {
+            keep[i] = false;
+            if i > 0 && matches!(rows[i - 1], Row::Blank) {
+                keep[i - 1] = false;
+            }
+        }
+    }
+    let mut idx = 0;
+    rows.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
 }
 
 /// Reads every line currently in the log whose timestamp is >= cutoff ("YYYY-MM-DD HH:MM:SS",
@@ -632,6 +701,7 @@ mod tests {
             step: step.map(str::to_string),
             warn: None,
             terminal: None,
+            id: None,
             item: item.to_string(),
             raw_item: item.to_string(),
         }
@@ -676,6 +746,82 @@ mod tests {
     }
 
     #[test]
+    fn a_later_item_with_the_same_id_replaces_the_earlier_one() {
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        let cleared = HashSet::new();
+        let mut first = line("t1", "s1", "repo", false, None, "/tmp/listen2");
+        first.id = Some("audio".to_string());
+        let mut second = line("t2", "s1", "repo", false, None, "/tmp/listen3");
+        second.id = Some("audio".to_string());
+        append_row(&mut rows, &mut last_key, &first, "/home/d", &cleared);
+        append_row(&mut rows, &mut last_key, &second, "/home/d", &cleared);
+
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::FileItem { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["/tmp/listen3"]);
+        // The first group's header went with it, so only one header remains.
+        let headers = rows
+            .iter()
+            .filter(|r| matches!(r, Row::GroupHeader { .. }))
+            .count();
+        assert_eq!(headers, 1);
+    }
+
+    #[test]
+    fn an_exact_repeat_replaces_but_other_sessions_and_items_stay() {
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        let cleared = HashSet::new();
+        for l in [
+            line("t1", "s1", "repo", true, None, "echo hi"),
+            line("t1", "s2", "repo", true, None, "echo hi"),
+            line("t1", "s1", "repo", true, None, "echo other"),
+            line("t2", "s1", "repo", true, None, "echo hi"),
+        ] {
+            append_row(&mut rows, &mut last_key, &l, "/home/d", &cleared);
+        }
+
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::CommandItem { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, ["t1|s2|echo hi", "t1|s1|echo other", "t2|s1|echo hi"]);
+    }
+
+    #[test]
+    fn different_ids_coexist() {
+        let mut rows = Vec::new();
+        let mut last_key = None;
+        let cleared = HashSet::new();
+        let mut a = line("t1", "s1", "repo", false, None, "/a");
+        a.id = Some("one".to_string());
+        let mut b = line("t1", "s1", "repo", false, None, "/b");
+        b.id = Some("two".to_string());
+        append_row(&mut rows, &mut last_key, &a, "/home/d", &cleared);
+        append_row(&mut rows, &mut last_key, &b, "/home/d", &cleared);
+        let items = rows
+            .iter()
+            .filter(|r| matches!(r, Row::FileItem { .. }))
+            .count();
+        assert_eq!(items, 2);
+    }
+
+    #[test]
+    fn id_field_parses_from_a_v2_line() {
+        let l = "2026-10-14 16:01:30\tsession=s1\trepo=r\tcwd=/tmp\tkind=review\tid=ab\titem=/tmp";
+        assert_eq!(parse_line(l).unwrap().id.as_deref(), Some("ab"));
+    }
+
+    #[test]
     fn command_rows_carry_their_step_label_and_a_stable_key() {
         let mut rows = Vec::new();
         let mut last_key = None;
@@ -694,6 +840,7 @@ mod tests {
             warn,
             terminal,
             key,
+            ..
         } = &rows[2]
         else {
             panic!("expected CommandItem")

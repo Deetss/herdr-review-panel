@@ -25,6 +25,12 @@ const DETAIL_TTL: Duration = Duration::from_millis(4000);
 /// that the queue doesn't stay cluttered with done items.
 const COMPLETE_DELAY: Duration = Duration::from_secs(10);
 
+/// A repeat copy of the same command within this window is treated as a duplicate delivery
+/// of the same click, not a deliberate re-copy - long enough to absorb a burst of duplicate
+/// events, short enough that an intentional re-copy moments later (say, after a failed
+/// paste) still goes through.
+const COPY_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Sentinel repo label for the synthetic trailing GroupHeader that collects completed
 /// commands. Paired with an empty `ts` (real log timestamps are never empty), so this can
 /// never collide with a genuine `(ts, repo)` group.
@@ -71,6 +77,8 @@ pub struct App {
     /// remotely - this is how the command becomes readable there. Desktop still
     /// gets the copy as well. Auto-hides after DETAIL_TTL, like the status toast (see detail_text).
     detail: Option<(String, Instant)>,
+    /// "command" or "path": what the detail overlay is currently showing.
+    detail_title: &'static str,
     /// Rows visible in the list area as of the last frame - drives ensure_cursor_visible, and
     /// lets scroll_by clamp independently of cursor position instead of fighting it every
     /// frame (a scroll wheel tick should move the view without yanking the cursor along).
@@ -87,6 +95,10 @@ pub struct App {
     /// run, not that it worked - this is where the human says which before anything gets
     /// reported back to the agent.
     pending_report: bool,
+    /// The key and time of the last copy, so a burst of duplicate click events for the same
+    /// row (observed under Orca - one physical click can deliver several Down events) copies
+    /// to the clipboard once instead of once per duplicate. See COPY_DEBOUNCE.
+    last_copy: Option<(String, Instant)>,
 }
 
 impl App {
@@ -142,6 +154,7 @@ impl App {
             close_hovered: false,
             clear_all_hovered: false,
             detail: None,
+            detail_title: "command",
             should_quit: false,
             log_path,
             offset,
@@ -158,6 +171,7 @@ impl App {
             notify_target: None,
             notified: HashSet::new(),
             pending_report: false,
+            last_copy: None,
         };
         app.sweep_completed();
         app.jump_to_latest();
@@ -170,6 +184,7 @@ impl App {
     /// tick).
     pub fn poll(&mut self) -> bool {
         let before = self.rows.len();
+        let offset_before = self.offset;
         self.offset = log::poll_tail(
             &self.log_path,
             self.offset,
@@ -198,7 +213,8 @@ impl App {
                 .retain(|r| row_key(r).is_none_or(|k| !self.cleared.contains(k)));
             self.prune_empty_groups();
         }
-        let structural_change = self.rows.len() != before;
+        // A replacement can leave the row count unchanged, so new log bytes count as change too.
+        let structural_change = self.rows.len() != before || self.offset != offset_before;
         if structural_change {
             self.jump_to_latest();
         }
@@ -251,6 +267,10 @@ impl App {
             .map(|(cmd, _)| cmd.as_str())
     }
 
+    pub fn detail_title(&self) -> &'static str {
+        self.detail_title
+    }
+
     /// Marks an item done for display purposes (struck through, eventually relocated to
     /// Completed) - shared by copying and by the checkbox. Does *not* report anything back
     /// to the agent; see confirm_done for that. Returns whether this call is what actually
@@ -265,26 +285,66 @@ impl App {
         }
     }
 
+    /// The checkbox's undo - reverses mark_done for an item that hasn't swept into Completed
+    /// yet (see toggle_done, the only caller). Also drops the item's group from `notified`,
+    /// so if it's re-confirmed later and the group becomes fully done again, the agent still
+    /// gets notified instead of that being silently swallowed by the earlier notification.
+    fn unmark_done(&mut self, key: &str) {
+        if !self.done.remove(key) {
+            return;
+        }
+        done::unmark(&self.done_path, key);
+        self.done_since.remove(key);
+        let group_key = key.splitn(3, '|').take(2).collect::<Vec<_>>().join("|");
+        self.notified.remove(&group_key);
+        self.set_status("Unchecked");
+    }
+
     /// The checkbox's "I actually ran this and it worked" confirmation, as opposed to just
-    /// copying it - copying only takes the command to run, so reporting back to the agent at
-    /// that point would be premature (you might still hit an error worth reporting some other
-    /// way instead of nothing being wrong at all). Only this path triggers the group/queue
-    /// completion check and the resulting notify.
+    /// copying it - copying only takes the command to run, so notifying the agent that a
+    /// *group* is done at that point would be premature (you might still hit an error worth
+    /// reporting some other way instead of nothing being wrong at all). Only this path
+    /// triggers that per-group notify; see maybe_prompt_report for the queue-wide finish,
+    /// which copying can trigger too since it still asks the human first either way.
     fn confirm_done(&mut self, key: &str) {
         if !self.mark_done(key) {
             return;
         }
-        // The last command anywhere in the queue just got confirmed - nothing left to do, so
-        // clear and close outright instead of just notifying this one group (which would
-        // leave an empty panel sitting open for no reason).
-        if self.all_commands_done() {
-            // Don't report yet - ask first (see report_prompt_active). Any lingering detail
-            // overlay would otherwise fight the prompt for the same area and its keys.
-            self.pending_report = true;
-            self.detail = None;
-        } else {
+        if !self.maybe_prompt_report() {
             self.check_group_complete(key);
         }
+    }
+
+    /// If marking something done just finished the whole queue, ask the human whether it all
+    /// went well before anything gets reported (see report_prompt_active) - regardless of
+    /// whether the last item was actually confirmed via checkbox or merely copied, since
+    /// either way the prompt itself is what stands between this and reporting to the agent,
+    /// not the checkbox. Shared by confirm_done and the copy path in run_activation, which
+    /// used to only ever reach this via the checkbox - leaving a fully-copied queue with no
+    /// way to close out was the "isn't reliably showing up" bug this fixes. Returns whether
+    /// it fired, so callers can skip whatever they'd otherwise show in the same screen space
+    /// (the detail overlay, e.g.) once the prompt has claimed it instead.
+    fn maybe_prompt_report(&mut self) -> bool {
+        if !self.all_commands_done() {
+            return false;
+        }
+        self.pending_report = true;
+        self.detail = None;
+        true
+    }
+
+    /// The checkbox's full behavior: marks a not-yet-done command done (confirm_done), or
+    /// undoes an already-done one (unmark_done) - as long as it hasn't relocated into the
+    /// Completed section yet, at which point the checkbox goes back to being one-way, since
+    /// CommandItem carries no `repo` to safely reconstruct where it came from.
+    fn toggle_done(&mut self, key: &str) {
+        if self.done.contains(key) {
+            if !self.completed.contains(key) {
+                self.unmark_done(key);
+            }
+            return;
+        }
+        self.confirm_done(key);
     }
 
     pub fn report_prompt_active(&self) -> bool {
@@ -294,7 +354,7 @@ impl App {
     /// 'y'/Enter on the finished-queue prompt: report success and clear/close as normal.
     pub fn confirm_report_success(&mut self) {
         self.pending_report = false;
-        self.clear_and_close("Finished the review queue - continue.");
+        self.clear_and_close(Some("Finished the review queue - continue."));
     }
 
     /// 'e' on the finished-queue prompt: report a problem instead of success, and leave the
@@ -401,32 +461,8 @@ impl App {
         self.completed.remove(key);
     }
 
-    /// Drops any GroupHeader (and its preceding Blank separator) left with no items under it
-    /// after clearing - so dismissing everything in a section, one at a time or all at once,
-    /// doesn't leave an orphaned timestamp/repo line with nothing beneath it.
     fn prune_empty_groups(&mut self) {
-        let mut keep = vec![true; self.rows.len()];
-        for i in 0..self.rows.len() {
-            if !matches!(self.rows[i], Row::GroupHeader { .. }) {
-                continue;
-            }
-            let has_items = self.rows[i + 1..]
-                .iter()
-                .take_while(|r| !matches!(r, Row::Blank | Row::GroupHeader { .. }))
-                .any(|r| matches!(r, Row::FileItem { .. } | Row::CommandItem { .. }));
-            if !has_items {
-                keep[i] = false;
-                if i > 0 && matches!(self.rows[i - 1], Row::Blank) {
-                    keep[i - 1] = false;
-                }
-            }
-        }
-        let mut idx = 0;
-        self.rows.retain(|_| {
-            let k = keep[idx];
-            idx += 1;
-            k
-        });
+        log::prune_empty_groups(&mut self.rows);
     }
 
     /// Relocates any command checked off at least COMPLETE_DELAY ago out of its normal
@@ -525,12 +561,12 @@ impl App {
         }
     }
 
-    /// Space/'d' (keyboard) or a click on the checkbox column (mouse): mark the command at the
-    /// cursor done. No-op for file rows, which have no done state.
+    /// Space/'d' (keyboard) or a click on the checkbox column (mouse): toggle the command at
+    /// the cursor done/not-done. No-op for file rows, which have no done state.
     pub fn toggle_done_cursor(&mut self) {
         if let Some(Row::CommandItem { key, .. }) = self.cursor.and_then(|c| self.rows.get(c)) {
             let key = key.clone();
-            self.confirm_done(&key);
+            self.toggle_done(&key);
         }
     }
 
@@ -581,7 +617,7 @@ impl App {
         match self.rows.get(row_idx) {
             Some(Row::CommandItem { key, .. }) if local_col < CHECKBOX_END_COL => {
                 let key = key.clone();
-                self.confirm_done(&key);
+                self.toggle_done(&key);
             }
             Some(row) => {
                 if let Some(activation) = plan_activation(row) {
@@ -594,19 +630,18 @@ impl App {
 
     /// The top "clear" button: wipes review.log, done-marks, and cleared-marks entirely via
     /// the same plugin.sh path the tools-menu action uses, then closes the panel the same
-    /// way click_close does.
+    /// way click_close does. Does not notify the agent.
     pub fn click_clear_all(&mut self) {
-        self.clear_and_close("Review queue cleared - continue.");
+        self.clear_and_close(None);
     }
 
     /// Shared by click_clear_all and all_commands_done's auto-trigger: wipes the queue,
-    /// notifies the flagging agent (covers cases per-group completion wouldn't catch on its
-    /// own - review-only groups with no checkbox to finish, and manual dismissals of items
-    /// nobody checked off), then closes the panel the same way click_close does.
-    fn clear_and_close(&mut self, notify_message: &str) {
+    /// optionally notifies the flagging agent (Some(message) only; the clear button sends
+    /// none), then closes the panel the same way click_close does.
+    fn clear_and_close(&mut self, notify_message: Option<&str>) {
         actions::clear_all();
-        if let Some(target) = &self.notify_target {
-            actions::notify_agent(target, notify_message);
+        if let (Some(message), Some(target)) = (notify_message, self.notify_target.as_ref()) {
+            actions::notify_agent(target, message);
         }
         actions::close();
         self.should_quit = true;
@@ -619,6 +654,11 @@ impl App {
         match activation {
             Activation::OpenFile(path) => {
                 let opener = actions::open_item(&path);
+                // List rows keep only a path's tail on a narrow pane, so show and copy the
+                // whole thing; the overlay wraps and the clipboard has it for pasting.
+                actions::copy_to_clipboard(&path);
+                self.detail = Some((path.clone(), Instant::now()));
+                self.detail_title = "path";
                 let label = Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -632,12 +672,26 @@ impl App {
                 self.set_status(msg);
             }
             Activation::CopyCommand { command, key } => {
+                let is_duplicate = self
+                    .last_copy
+                    .as_ref()
+                    .is_some_and(|(k, at)| k == &key && at.elapsed() < COPY_DEBOUNCE);
+                if is_duplicate {
+                    return;
+                }
+                self.last_copy = Some((key.clone(), Instant::now()));
                 actions::copy_to_clipboard(&command);
                 // Copying is the act of taking the command to run it; the checkbox is for
-                // the ones run some other way. One-way like the checkbox, so a re-copy
-                // (say, after a failed paste) never unmarks it.
+                // the ones run some other way. mark_done, not confirm_done or toggle_done -
+                // a re-copy (say, after a failed paste) still never unmarks it; only the
+                // checkbox itself can undo the mark this leaves behind (see toggle_done).
                 self.mark_done(&key);
-                self.detail = Some((command, Instant::now()));
+                // If that was the last command in the queue, the finish prompt now owns the
+                // screen - don't also show the detail overlay underneath it.
+                if !self.maybe_prompt_report() {
+                    self.detail = Some((command, Instant::now()));
+                    self.detail_title = "command";
+                }
                 self.set_status("Copied to clipboard");
             }
         }
@@ -735,6 +789,15 @@ mod tests {
         )
     }
 
+    /// Same as two_line_group, but both lines are commands - for tests that need to act on
+    /// one command without that also being the last one in the queue.
+    fn two_command_group(repo: &str, cmd_a: &str, cmd_b: &str) -> String {
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
+        format!(
+            "{ts} session=s repo={repo} cwd=/home/d kind=command item={cmd_a}\n{ts} session=s repo={repo} cwd=/home/d kind=command item={cmd_b}\n"
+        )
+    }
+
     #[test]
     fn backfill_jumps_cursor_to_the_last_item() {
         let f = fixture(&two_line_group("r", "a.txt", "b.txt"));
@@ -770,6 +833,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rapid_duplicate_copy_is_suppressed_but_a_later_one_is_not() {
+        // Two commands, not one - copying the only remaining command would also trigger the
+        // finish prompt (see maybe_prompt_report) and clear `detail`, which isn't what this
+        // test is about.
+        let mut f = fixture(&two_command_group("r", "echo hi", "echo bye"));
+        f.app.cursor = Some(2); // "echo hi"
+        let idx = f.app.cursor.unwrap();
+        f.app.click_row(idx, CHECKBOX_END_COL + 2, 80); // first copy
+        let first_detail_at = f.app.detail.as_ref().unwrap().1;
+
+        // Immediately duplicate - within COPY_DEBOUNCE, so this should be a no-op and leave
+        // detail's timestamp exactly as the first copy set it.
+        f.app.click_row(idx, CHECKBOX_END_COL + 2, 80);
+        assert_eq!(f.app.detail.as_ref().unwrap().1, first_detail_at);
+
+        // No real sleep: back-date the in-memory timer past COPY_DEBOUNCE directly.
+        f.app.last_copy = f
+            .app
+            .last_copy
+            .take()
+            .map(|(key, _)| (key, Instant::now() - COPY_DEBOUNCE * 2));
+        f.app.click_row(idx, CHECKBOX_END_COL + 2, 80);
+        assert_ne!(f.app.detail.as_ref().unwrap().1, first_detail_at);
+    }
+
+    #[test]
     fn toggle_done_marks_a_command_and_persists_it() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         f.app.toggle_done_cursor();
@@ -781,6 +870,59 @@ mod tests {
     }
 
     #[test]
+    fn toggle_done_cursor_marks_then_unmarks_before_sweep() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        let key = {
+            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        assert!(f.app.is_done(&key));
+        f.app.toggle_done_cursor();
+        assert!(!f.app.is_done(&key));
+        assert!(!f.app.done_since.contains_key(&key));
+        assert!(!done::load(&f.app.done_path).contains(&key));
+    }
+
+    #[test]
+    fn unchecking_a_copied_item_untracks_it() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        let idx = f.app.cursor.unwrap();
+        f.app.click_row(idx, CHECKBOX_END_COL, 80);
+        let key = {
+            let Row::CommandItem { key, .. } = &f.app.rows[idx] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        assert!(f.app.is_done(&key), "copy should have marked it done");
+        f.app.click_row(idx, 0, 80); // inside the checkbox column
+        assert!(!f.app.is_done(&key), "checkbox should undo the copy's mark");
+    }
+
+    #[test]
+    fn toggle_is_a_noop_once_swept_to_completed() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        let key = {
+            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
+                panic!("expected CommandItem")
+            };
+            key.clone()
+        };
+        f.app
+            .done_since
+            .insert(key.clone(), Instant::now() - Duration::from_secs(11));
+        f.app.sweep_completed();
+        assert!(f.app.completed.contains(&key));
+        f.app.toggle_done_cursor();
+        assert!(f.app.is_done(&key), "already-swept items stay one-way");
+        assert!(f.app.completed.contains(&key));
+    }
+
+    #[test]
     fn checking_off_the_last_command_asks_before_reporting() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         f.app.toggle_done_cursor();
@@ -789,12 +931,16 @@ mod tests {
     }
 
     #[test]
-    fn copying_the_last_command_does_not_ask_to_report() {
+    fn copying_the_last_command_still_asks_to_report() {
+        // Copying alone used to never reach the finish prompt, leaving a fully-copied queue
+        // with no way to close out - see maybe_prompt_report.
         let mut f = fixture(&now_command_line("r", "echo hi"));
         let idx = f.app.cursor.unwrap();
         f.app.click_row(idx, CHECKBOX_END_COL + 2, 80); // on the command text: copy
-        assert!(!f.app.report_prompt_active());
+        assert!(f.app.report_prompt_active());
         assert!(!f.app.should_quit);
+        // The prompt now owns the screen instead of the copy's detail overlay.
+        assert!(f.app.detail_text().is_none());
     }
 
     #[test]

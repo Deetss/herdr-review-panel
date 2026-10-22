@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/dev/x
+item	review	-	-	/tmp/a/listen2	-	audio-ab
+item	command	1	-	ls	ssh:box	run
+stat	opens=2	closes=2	matched=2	fences=0	bytes=135

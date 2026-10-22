@@ -5,13 +5,14 @@
 #      two-character sequences and a record can never span lines.
 #
 #   ctx  \t session \t cwd
-#   item \t kind    \t step   \t warn    \t body     \t terminal -> log it
+#   item \t kind    \t step   \t warn    \t body     \t terminal [\t id] -> log it
 #   near \t kind    \t reason \t preview            -> log as a warn= row
 #   drop \t kind    \t reason \t body               -> debug only, never logged
 #   stat \t key=value ...                           -> debug only
 #
 # `terminal` is appended last (not inserted after step) so every existing golden fixture
 # only needs a trailing `\t-` rather than a reordering of columns it already asserts on.
+# `id` follows it and is omitted entirely when absent, so fixtures without one are untouched.
 #
 # No side effects, so this is testable standalone:
 #   jq -r -f review-parse.jq < fixture.json
@@ -62,15 +63,19 @@ def step_of($a): ([$a | capture("step\\s*=\\s*\"(?<s>[^\"]*)\"")] | .[0].s) // "
 # so the value always stays one well-formed field in the queue log.
 def terminal_of($a): ([$a | capture("terminal\\s*=\\s*\"(?<t>[^\"\\n]*)\"")] | .[0].t) // "";
 
+# A later item in the same session carrying the same id replaces the earlier one in the panel.
+def id_of($a): ([$a | capture("\\bid\\s*=\\s*\"(?<i>[^\"]*)\"")] | .[0].i) // "";
+
 def ATTR:
     "(?:step\\s*=\\s*\"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\""
-  + "|terminal\\s*=\\s*\"[^\"\\n]{1,64}\")";
+  + "|terminal\\s*=\\s*\"[^\"\\n]{1,64}\""
+  + "|id\\s*=\\s*\"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\")";
 
-# Only an empty attribute list, or up to one each of step="..." and terminal="..." in
-# either order, is a real tag. This one rule is what kills a reply that quotes the
+# Only an empty attribute list, or up to one each of step="...", terminal="..." and id="..."
+# in any order, is a real tag. This one rule is what kills a reply that quotes the
 # parser's own regex: the attrs it captures from `<user_command\b[^>]*>` are `\b[^`, which
 # fails here.
-def attrs_ok($a): $a | test("^\\s*(?:" + ATTR + "\\s*){0,2}$");
+def attrs_ok($a): $a | test("^\\s*(?:" + ATTR + "\\s*){0,3}$");
 
 def shelly($b): $b | test("[/|><$=\"'\\\\`*&;]|\\s-{1,2}[A-Za-z]");
 
@@ -113,7 +118,7 @@ def is_prose($b):
       elif (EXAMPLES | index($body))  then ["drop", $kind, "example", $body]
       elif $fenced                    then ["drop", $kind, "fenced", $body]
       else ["item", $kind, (step_of($attrs) | dash), ($warn | dash), ($body[0:MAXLOG]),
-              (terminal_of($attrs) | dash)]
+              (terminal_of($attrs) | dash)] + (if id_of($attrs) == "" then [] else [id_of($attrs)] end)
       end ),
   # Report only the opens that no match consumed, by offset. Counting opens against
   # matches would re-report tags that parsed fine alongside a genuinely unclosed one.
