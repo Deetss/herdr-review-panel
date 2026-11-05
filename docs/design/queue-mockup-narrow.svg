@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1100" viewBox="0 0 720 1100" xml:space="preserve">
+<style>
+text { font-family: "Liberation Mono", "JetBrains Mono", monospace; font-size: 16.6px; fill: #d8dadb; }
+.cap { font-family: "Liberation Sans", sans-serif; font-size: 15px; fill: #d8dadb; }
+.t { fill: #d8dadb; }
+.h { fill: #8abeb7; font-weight: bold; }
+.d { fill: #d8dadb; opacity: 0.6; }
+.c { fill: #b294bb; }
+.g { fill: #a8aaa9; }
+.s { fill: #a8aaa9; font-weight: bold; }
+.x { fill: #cc6666; opacity: 0.6; }
+.rr { fill: #cc6666; }
+.y { fill: #f0c674; }
+.k { fill: #707880; text-decoration: line-through; }
+.kk { fill: #707880; }
+.inv { fill: #1d1f21; }
+.dh { fill: #8abeb7; font-weight: bold; opacity: 0.6; }
+</style>
+<rect width="720" height="1100" fill="#101214"/>
+<text class="cap" x="20" y="22">Review queue, 32 columns (31 drawable). Grey strip = Orca overlay inset. Cells 10 x 20 px.</text>
+
+<!-- (a) default -->
+<text class="cap" x="20" y="48">(a) Default, DONE collapsed</text>
+<g transform="translate(20,56)">
+<rect width="320" height="480" fill="#1d1f21"/>
+<rect width="320" height="20" fill="#2a2d30"/><rect x="310" width="10" height="480" fill="#2a2d30"/>
+<rect x="20" y="200" width="40" height="20" fill="#a8aaa9"/><rect x="60" y="200" width="100" height="20" fill="#b294bb"/>
+<text x="0" y="35"><tspan class="h">4 open · 4 done</tspan></text><text class="rr" x="230" y="35">clear</text><text class="y" x="300" y="35">x</text>
+<text class="d" x="0" y="55">───────────────────────────────</text>
+<text class="s" x="0" y="75">OPEN</text>
+<text x="0" y="95"><tspan class="h">hub</tspan><tspan class="d"> 17:28</tspan></text><text class="x" x="300" y="95">x</text>
+<text x="0" y="115"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">1. </tspan><tspan class="c">systemctl restart o…</tspan></text><text class="x" x="300" y="115">x</text>
+<text x="0" y="135"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">2. </tspan><tspan class="c">hyprctl activewindow</tspan></text><text class="x" x="300" y="135">x</text>
+<text x="0" y="155"><tspan class="h">hub</tspan><tspan class="d"> 08:54</tspan></text><text class="x" x="300" y="155">x</text>
+<text x="0" y="175"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="c">docker compose ps</tspan></text><text class="x" x="300" y="175">x</text>
+<text x="0" y="195"><tspan class="h">cqc</tspan><tspan class="d"> 09:07</tspan></text><text class="x" x="300" y="195">x</text>
+<text x="0" y="215"><tspan>  </tspan><tspan class="inv">[ ] </tspan><tspan class="inv">cargo test</tspan></text><text class="x" x="300" y="215">x</text>
+<text class="s" x="0" y="255">DONE (4)</text>
+<text x="0" y="275"><tspan class="d">hub  </tspan><tspan class="g">[x] </tspan><tspan class="d">3 rows, 17:20</tspan></text><text class="x" x="300" y="275">x</text>
+<text x="0" y="295"><tspan class="d">cqc  </tspan><tspan class="g">[x] </tspan><tspan class="d">1 row, 09:05</tspan></text><text class="x" x="300" y="295">x</text>
+<text class="d" x="0" y="455">Space done · Bksp clear</text>
+<text class="d" x="0" y="475">c clear done · H hidden</text>
+</g>
+
+<!-- (b) DONE session expanded -->
+<text class="cap" x="380" y="48">(b) DONE session expanded</text>
+<g transform="translate(380,56)">
+<rect width="320" height="480" fill="#1d1f21"/>
+<rect width="320" height="20" fill="#2a2d30"/><rect x="310" width="10" height="480" fill="#2a2d30"/>
+<rect x="0" y="260" width="220" height="20" fill="#a8aaa9"/>
+<text x="0" y="35"><tspan class="h">4 open · 4 done</tspan></text><text class="rr" x="230" y="35">clear</text><text class="y" x="300" y="35">x</text>
+<text class="d" x="0" y="55">───────────────────────────────</text>
+<text class="s" x="0" y="75">OPEN</text>
+<text x="0" y="95"><tspan class="h">hub</tspan><tspan class="d"> 17:28</tspan></text><text class="x" x="300" y="95">x</text>
+<text x="0" y="115"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">1. </tspan><tspan class="c">systemctl restart o…</tspan></text><text class="x" x="300" y="115">x</text>
+<text x="0" y="135"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">2. </tspan><tspan class="c">hyprctl activewindow</tspan></text><text class="x" x="300" y="135">x</text>
+<text x="0" y="155"><tspan class="h">hub</tspan><tspan class="d"> 08:54</tspan></text><text class="x" x="300" y="155">x</text>
+<text x="0" y="175"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="c">docker compose ps</tspan></text><text class="x" x="300" y="175">x</text>
+<text x="0" y="195"><tspan class="h">cqc</tspan><tspan class="d"> 09:07</tspan></text><text class="x" x="300" y="195">x</text>
+<text x="0" y="215"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="c">cargo test</tspan></text><text class="x" x="300" y="215">x</text>
+<text class="s" x="0" y="255">DONE (4)</text><text class="d" x="200" y="255">Enter: fold</text>
+<text x="0" y="275"><tspan class="inv">hub  </tspan><tspan class="inv">[x] </tspan><tspan class="inv">3 rows, 17:20</tspan></text><text class="x" x="300" y="275">x</text>
+<text x="0" y="295"><tspan>  </tspan><tspan class="g">[x] </tspan><tspan class="k">docker compose up -d</tspan></text><text class="x" x="300" y="295">x</text>
+<text x="0" y="315"><tspan>  </tspan><tspan class="g">[x] </tspan><tspan class="k">docker compose logs</tspan></text><text class="x" x="300" y="315">x</text>
+<text x="0" y="335"><tspan>  </tspan><tspan class="g">[x] </tspan><tspan class="k">curl -s localhost:3000…</tspan></text><text class="x" x="300" y="335">x</text>
+<text x="0" y="355"><tspan class="d">cqc  </tspan><tspan class="g">[x] </tspan><tspan class="d">1 row, 09:05</tspan></text><text class="x" x="300" y="355">x</text>
+<text class="d" x="0" y="455">Enter fold · Bksp clear</text>
+<text class="d" x="0" y="475">c clear done · H hidden</text>
+</g>
+
+<!-- (c) hidden view -->
+<text class="cap" x="20" y="578">(c) Hidden view (H)</text>
+<g transform="translate(20,586)">
+<rect width="320" height="480" fill="#1d1f21"/>
+<rect width="320" height="20" fill="#2a2d30"/><rect x="310" width="10" height="480" fill="#2a2d30"/>
+<rect x="20" y="360" width="40" height="20" fill="#a8aaa9"/><rect x="60" y="360" width="140" height="20" fill="#707880"/>
+<text x="0" y="35"><tspan class="h">4 open · 4 done</tspan></text><text class="rr" x="210" y="35">restore</text><text class="y" x="300" y="35">x</text>
+<text class="d" x="0" y="55">───────────────────────────────</text>
+<text class="s" x="0" y="75">OPEN</text>
+<text x="0" y="95"><tspan class="h">hub</tspan><tspan class="d"> 17:28</tspan></text><text class="x" x="300" y="95">x</text>
+<text x="0" y="115"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">1. </tspan><tspan class="c">systemctl restart o…</tspan></text><text class="x" x="300" y="115">x</text>
+<text x="0" y="135"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="d">2. </tspan><tspan class="c">hyprctl activewindow</tspan></text><text class="x" x="300" y="135">x</text>
+<text x="0" y="155"><tspan class="h">hub</tspan><tspan class="d"> 08:54</tspan></text><text class="x" x="300" y="155">x</text>
+<text x="0" y="175"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="c">docker compose ps</tspan></text><text class="x" x="300" y="175">x</text>
+<text x="0" y="195"><tspan class="h">cqc</tspan><tspan class="d"> 09:07</tspan></text><text class="x" x="300" y="195">x</text>
+<text x="0" y="215"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="c">cargo test</tspan></text><text class="x" x="300" y="215">x</text>
+<text class="s" x="0" y="255">DONE (4)</text>
+<text x="0" y="275"><tspan class="d">hub  </tspan><tspan class="g">[x] </tspan><tspan class="d">3 rows, 17:20</tspan></text><text class="x" x="300" y="275">x</text>
+<text x="0" y="295"><tspan class="d">cqc  </tspan><tspan class="g">[x] </tspan><tspan class="d">1 row, 09:05</tspan></text><text class="x" x="300" y="295">x</text>
+<text class="s" x="0" y="335">HIDDEN (3)</text>
+<text class="dh" x="0" y="355">hub</text><text class="d" x="40" y="355">17:28</text>
+<text x="0" y="375"><tspan>  </tspan><tspan class="inv">[ ] </tspan><tspan class="inv">systemctl sta…</tspan></text><text class="d" x="210" y="375">superseded</text>
+<text x="0" y="395"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="kk">journalctl -u or…</tspan></text><text class="d" x="240" y="395">cleared</text>
+<text class="dh" x="0" y="415">cqc</text><text class="d" x="40" y="415">09:07</text>
+<text x="0" y="435"><tspan>  </tspan><tspan class="g">[ ] </tspan><tspan class="kk">cargo build</tspan></text><text class="d" x="240" y="435">cleared</text>
+<text class="d" x="0" y="455">r restore · R restore all</text>
+<text class="d" x="0" y="475">H back</text>
+</g>
+
+<!-- (d) empty -->
+<text class="cap" x="380" y="578">(d) Empty queue</text>
+<g transform="translate(380,586)">
+<rect width="320" height="480" fill="#1d1f21"/>
+<rect width="320" height="20" fill="#2a2d30"/><rect x="310" width="10" height="480" fill="#2a2d30"/>
+<text x="0" y="35"><tspan class="h">Queue: 0 open · 0 done</tspan></text><text class="y" x="300" y="35">x</text>
+<text class="d" x="0" y="55">───────────────────────────────</text>
+<text class="d" x="0" y="75">Nothing to review.</text>
+<text class="d" x="0" y="475">H hidden · q close</text>
+</g>
+</svg>

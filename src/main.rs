@@ -2,7 +2,9 @@ mod actions;
 mod app;
 mod cleared;
 mod done;
+mod events;
 mod log;
+mod queue;
 mod theme;
 mod ui;
 
@@ -25,18 +27,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--hide-all") {
+        return hide_all(&args[2..]);
+    }
     let log_path = std::env::var("REVIEW_PANEL_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude/review.log")
         });
-    let window_minutes: i64 = std::env::var("REVIEW_PANEL_WINDOW_MINUTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
     let notify_target = std::env::var("REVIEW_PANEL_NOTIFY_TARGET").ok();
 
-    let mut app = App::new(log_path, window_minutes, notify_target);
+    let mut app = App::new(log_path, notify_target);
 
     let mut terminal = ratatui::init();
     // The pane title is how plugin.sh finds an open panel; without this the pane keeps the
@@ -52,6 +54,17 @@ fn main() -> Result<()> {
     result
 }
 
+/// `--hide-all <review.log> <cleared.log>`: the non-interactive `plugin.sh clear`. Appends a
+/// `hide` event per visible row, so the panel and the script share one key format.
+fn hide_all(paths: &[String]) -> Result<()> {
+    let [log, cleared] = paths else {
+        anyhow::bail!("usage: review-panel --hide-all <review.log> <cleared.log>");
+    };
+    let hidden = actions::clear_all(&PathBuf::from(log), &PathBuf::from(cleared));
+    println!("hid {hidden} rows in {log}");
+    Ok(())
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut areas: Option<ui::Areas> = None;
 
@@ -59,7 +72,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_poll = Instant::now();
     loop {
         let size = terminal.size()?;
-        app.set_visible_height(size.height.saturating_sub(3) as usize);
+        app.set_visible_height(ui::body_height(app, size.width, size.height));
         terminal.draw(|frame| areas = Some(ui::draw(frame, app)))?;
 
         let mut force_poll = false;
@@ -96,11 +109,16 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                         KeyCode::Enter => app.activate_cursor(),
                         KeyCode::Char(' ') | KeyCode::Char('d') => app.toggle_done_cursor(),
                         KeyCode::Backspace | KeyCode::Delete => app.clear_cursor(),
-                        // Shifted, because clearing everything from a stray keypress is not
-                        // recoverable. The mouse route has a dedicated button; this is its only
-                        // keyboard equivalent, which keyboard-only remote clients need.
+                        KeyCode::Char('c') => app.clear_done(),
+                        // Shifted so a stray keypress does not hide the whole queue. The mouse
+                        // route has a dedicated button; this is its keyboard equivalent.
                         KeyCode::Char('C') => app.click_clear_all(),
-                        KeyCode::Esc | KeyCode::Char('q') => app.click_close(),
+                        KeyCode::Char('S') => app.clear_session(),
+                        KeyCode::Char('H') => app.toggle_hidden_view(),
+                        KeyCode::Char('r') => app.restore_cursor(),
+                        KeyCode::Char('R') => app.restore_all(),
+                        KeyCode::Esc => app.escape(),
+                        KeyCode::Char('q') => app.click_close(),
                         _ => {}
                     },
                     Event::Mouse(mouse) => {

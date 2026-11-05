@@ -4,7 +4,7 @@
 #   plugin.sh open       open the sidebar, no-op if one is already open
 #   plugin.sh toggle     open the sidebar, or close it if one is already open
 #   plugin.sh close      close every Review Queue pane in this tab, no-op if none
-#   plugin.sh clear      truncate the underlying review.log, done-marks, and cleared-marks files
+#   plugin.sh clear      hide every row by appending events to the cleared log (nothing is cut)
 #   plugin.sh open-item  open the file:// path Ctrl+clicked in the sidebar
 #   plugin.sh notify     tell the agent that flagged items to continue
 #
@@ -57,11 +57,13 @@ rebuild_if_stale() {
   fi
 }
 
+# Appends a `hide` event per visible row. No file is cut or rewritten. The panel binary
+# builds the `ts|session|item` keys, so the script never rebuilds one.
 if [ "$mode" = "clear" ]; then
-  : >"$QUEUE_LOG" 2>/dev/null || refuse "cannot clear $QUEUE_LOG"
-  : >"$DONE_LOG" 2>/dev/null
-  : >"$CLEARED_LOG" 2>/dev/null
-  printf 'cleared %s\n' "$QUEUE_LOG"
+  [ -r "$QUEUE_LOG" ] || refuse "cannot read $QUEUE_LOG"
+  rebuild_if_stale
+  [ -x "$BIN" ] || refuse "cannot find $BIN"
+  "$BIN" --hide-all "$QUEUE_LOG" "$CLEARED_LOG" || refuse "cannot append to $CLEARED_LOG"
   exit 0
 fi
 

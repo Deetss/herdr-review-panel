@@ -6,12 +6,16 @@ commands only you should run. Flag either in a reply and they show up in a split
 click, copy, check off, and clear.
 
 ```
-click: open/copy · box: done · x: clear                                       clear  x
+Queue: 3 open · 1 done                                                        clear  x
 ─────────────────────────────────────────────────────────────────────────────────────
-13:23  my-project                                                                   x
+OPEN
+my-project 13:23                                                                    x
       /home/me/my-project/etc/fail2ban/jail.local                                   x
-  [ ] 2a. sudo systemctl enable --now fail2ban                                      x
-  [x] echo "ok" >> ~/.ssh/authorized_keys                                           x
+  [ ] 1. sudo systemctl enable --now fail2ban                                       x
+  [ ] 2. sudo systemctl status fail2ban                                             x
+
+DONE (1)
+my-project  [x] 1 row, 13:20                                                        x
 ```
 
 ## Why
@@ -38,11 +42,11 @@ replies:
   tmux with no explicit `terminal=`, it carries no location at all.
 
 Either tag takes `id="name"` (letters, digits, `.`, `_`, `-`, up to 32). A later item in the
-same session with the same id **replaces** the earlier one, so an agent that regenerates a
-file or revises a command swaps the stale row instead of stacking a second one. An exact
-repeat of the same kind and value from the same session replaces too, with no id needed.
-The log stays append-only; replacement happens as rows are built, so a restart converges on
-the same view. Clicking a file row opens it, copies its full path, and shows the path in the
+same session with the same id **supersedes** the earlier one, so an agent that regenerates a
+file or revises a command swaps the stale row instead of stacking a second one. A later item
+of the same kind and value from the same session supersedes too, with no id needed. A
+superseded row is hidden, not deleted. The log stays append-only; supersession is derived
+whenever rows are built, so a restart converges on the same view. Clicking a file row opens it, copies its full path, and shows the path in the
 detail overlay, since a narrow pane only has room for the tail.
 
 Matches get logged to a queue scoped to the Orca tab they came from (`ORCA_TAB_ID`, under
@@ -74,8 +78,8 @@ hook at its own 10s budget with no trace.
 
 When you're done with a group (or the whole queue), the panel asks whether it all went well
 and, on "yes," tells the agent that flagged it to continue via `orca terminal send`, so
-nobody has to go back and prompt it by hand. The top `clear` button wipes the queue without
-telling the agent anything at all.
+nobody has to go back and prompt it by hand. The top `clear` button hides every open and done
+row without telling the agent anything, and the panel stays open on the empty state.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
 reply) and read `~/.claude/review-debug.log`.
@@ -85,16 +89,44 @@ reply) and read `~/.claude/review-debug.log`.
 | Action | Mouse | Keyboard |
 |---|---|---|
 | Open a file / copy a command (copying also checks it off) | Click its text | `Enter` |
-| Check a command off | Click its checkbox | `Space` or `d` |
+| Check a command off, or reopen a done one | Click its checkbox | `Space` or `d` |
+| Expand or fold a session's done rows | Click its DONE summary line | `Enter` on the summary |
 | Clear one row | Click the `x` on its row | `Backspace`/`Delete` |
-| Clear a whole section | Click the `x` on its header | `Backspace`/`Delete` on the header |
-| Clear everything | Click `clear` (top) | - |
+| Clear a whole session | Click the `x` on its header | `Backspace`/`Delete` on the header |
+| Clear every done row | Click the `x` on a DONE summary (one session) | `c` |
+| Clear a whole session | - | `S` on any of its rows |
+| Clear everything | Click `clear` (top) | `C` |
+| Show or leave the hidden view | - | `H` (`Esc` also leaves it) |
+| Restore one hidden row, or a session from its header | Click the row's checkbox | `r` |
+| Restore every hidden row | Click `restore` (top, hidden view) | `R` |
 | Close the panel | Click `x` (top) | `Esc` or `q` |
-| Clear does not notify the agent - it only wipes the queue. Confirming the finished queue does. | - | - |
+| Clear does not notify the agent - it only hides the queue. Confirming the finished queue does. | - | - |
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
 
-Checking a command off keeps it visible, struck through. Clearing removes it entirely. Both
-persist across restarts and sync live across multiple open panel instances.
+The header shows the open and done counts. The body is an OPEN list, one header per session
+with its repo and the time of its newest open row (most recent session last), then a DONE
+drawer with one summary line per session, collapsed by default. A step label (`1.`) only shows
+when another open row in the same session has one. Checking a command off moves it to the
+drawer, and expanding the summary shows it struck through. Unchecking reopens it. Clearing
+hides a row from the panel. Two footer rows show the keys for whatever the cursor is on.
+The panel starts with the cursor on the newest open row.
+
+`H` adds a HIDDEN section below DONE, grouped by session. Each row is tagged `cleared` (hidden
+by a clear) or `superseded` (replaced by a newer command with the same `id`, or the same kind
+and value, from the same session). A row that is both reads `cleared`. The `clear` button
+becomes `restore`, and the cursor only visits hidden rows. `r` and `R` append `show` events,
+and a `show` on a superseded row brings it back beside its replacement.
+
+## Where state lives
+
+No file is ever truncated, rewritten or pruned. `~/.claude/review.log` holds the flagged items.
+`~/.claude/review-done.log` and `~/.claude/review-cleared.log` hold one event per line,
+`{unix_ts} done|open {key}` and `{unix_ts} hide|show {key}`, and the last event for a key wins.
+A line with no timestamp is a legacy mark and reads as `done` or `hide`. Checking, unchecking
+and clearing append events, so all three persist across restarts and sync live across open
+panel instances. `plugin.sh clear` runs `review-panel --hide-all <review.log> <cleared.log>`,
+and that and the `clear` button append `hide` events and leave `review.log` untouched. The files grow without bound by design. There is no time window and no
+sweep of done rows, so `REVIEW_PANEL_WINDOW_MINUTES` no longer exists.
 
 A clicked file opens in Orca's editor (`orca file open`) when it lives inside the current
 worktree, and falls back to VS Code, then `xdg-open` on its directory, otherwise.
@@ -104,7 +136,7 @@ worktree, and falls back to VS Code, then `xdg-open` on its directory, otherwise
 Orca Mobile mirrors terminals, so the panel is already on your phone. It is fully
 keyboard-drivable for clients without a mouse: arrows, Enter, Space, Escape and Backspace
 cover navigate / activate / mark done / close / clear one row, and `C` clears the whole
-queue (shifted, because there is no undo). Activating a command row also opens it
+queue (shifted, so a stray keypress does not hide it). Activating a command row also opens it
 full-screen, which is the only way to read a long command where OSC-52 clipboard copy
 cannot reach.
 
@@ -175,7 +207,8 @@ Requires a Rust toolchain (stable) and [Orca](https://www.onorca.dev) for the li
 
 ```bash
 cargo build --release   # produces target/release/review-panel, which plugin.sh launches
-cargo test              # unit tests covering log parsing/grouping and app state
+cargo test              # unit tests covering log parsing/grouping, app state and panel layout
+# REVIEW_PANEL_CAPTURE_DIR=<dir> cargo test also writes each layout state as an SVG there
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 
