@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "Example:\n\n```bash\n<user_command>echo hi</user_command>\n```\n\nThat is the shape."
+}

@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "```queue step=1\ncd /srv/app\ngit pull --ff-only\n\nsystemctl restart app\n```"
+}

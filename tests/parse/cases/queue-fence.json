@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "Run this:\n\n```queue\nsudo systemctl restart nginx\n```\n\nThen check the logs."
+}

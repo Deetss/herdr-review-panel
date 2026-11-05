@@ -32,7 +32,12 @@ def TAG_RE:
   # the single largest source of dropped items.
   + "(?<close></user_command>|</user_review>|</parameter>)";
 
-def FENCE_RE: "(?<f>```|~~~).*?\\k<f>";
+def FENCE_RE: "(?<f>```|~~~)(?<inner>.*?)\\k<f>";
+
+# A fence whose info string starts with the word `queue` carries one command. Matching
+# runs on the inner text of a fence FENCE_RE already found, so a queue fence never changes
+# where any other fence starts or ends.
+def QUEUE_FENCE_RE: "\\Aqueue(?<info>(?:[ \\t][^\\n]*)?)\\n(?<body>(?:.|\\n)*)\\z";
 
 # A reply naming the tag in prose rather than issuing it - `<user_command>` sitting alone
 # inside a single-backtick code span, per CLAUDE.md's own convention for referring to the
@@ -77,6 +82,24 @@ def ATTR:
 # fails here.
 def attrs_ok($a): $a | test("^\\s*(?:" + ATTR + "\\s*){0,3}$");
 
+# Same value rules as ATTR, but a fence info string also takes unquoted values
+# (key=value) and needs whitespace between tokens.
+def FVAL: "[A-Za-z0-9][A-Za-z0-9._-]{0,31}";
+
+def FTOKEN:
+    "(?:step=(?:\"" + FVAL + "\"|" + FVAL + ")"
+  + "|terminal=(?:\"[^\"\\n]{1,64}\"|[^\\s\"]{1,64})"
+  + "|id=(?:\"" + FVAL + "\"|" + FVAL + "))";
+
+def fattrs_ok($i): $i | test("^(?:\\s+" + FTOKEN + "){0,3}\\s*$");
+
+# Only called once fattrs_ok has passed, so the tokens tile the whole string and a
+# global scan cannot pick one out of the middle of a quoted value.
+def fattr($i; $k):
+  ( [ $i | match("(?<k>step|terminal|id)=(?:\"(?<q>[^\"\\n]*)\"|(?<u>[^\\s\"]+))"; "g")
+      | select(cap(.; "k") == $k)
+      | (cap(.; "q") + cap(.; "u")) ] | .[0] ) // "";
+
 def shelly($b): $b | test("[/|><$=\"'\\\\`*&;]|\\s-{1,2}[A-Za-z]");
 
 # Reads like a paraphrased task rather than a runnable command. Warns, never drops.
@@ -95,13 +118,15 @@ def is_prose($b):
 
 . as $p
 | (($p.last_assistant_message // "")) as $msg
-| ([$msg | match(FENCE_RE; "gm") | {s: .offset, e: (.offset + .length)}]) as $fences
+| ([$msg | match(FENCE_RE; "gm") | {s: .offset, e: (.offset + .length), inner: cap(.; "inner")}]) as $fences
 | ([$msg | match(BARE_MENTION_RE; "gm") | {s: .offset, e: (.offset + .length)}]) as $bare
 | ([$msg | match(TAG_RE; "gm")]) as $ms
 | ([$msg | match("<user_(?:command|review)\\b"; "g")] | length) as $opens
 | ([$msg | match("</user_(?:command|review)>"; "g")] | length) as $closes
 | ["ctx", ($p.session_id // "unknown" | dash), ($p.cwd // "" | dash)],
-  ( $ms[]
+  # Tag rows and queue-fence rows are tagged with their offset and merged, so the output
+  # keeps message order. sort_by is stable.
+  ( [ $ms[]
     | . as $m
     | cap($m; "tag")   as $kind
     | cap($m; "attrs") as $attrs
@@ -113,13 +138,32 @@ def is_prose($b):
           (if ($raw | length) > MAXLOG then "truncated" else empty end),
           (if $kind == "command" and is_prose($body) then "prose" else empty end)
         ] | join(",") ) as $warn
-    | if   (attrs_ok($attrs) | not)   then ["drop", $kind, "badattrs", $body]
-      elif ($body | length) == 0      then ["near", $kind, "empty", ($attrs | dash)]
-      elif (EXAMPLES | index($body))  then ["drop", $kind, "example", $body]
-      elif $fenced                    then ["drop", $kind, "fenced", $body]
-      else ["item", $kind, (step_of($attrs) | dash), ($warn | dash), ($body[0:MAXLOG]),
-              (terminal_of($attrs) | dash)] + (if id_of($attrs) == "" then [] else [id_of($attrs)] end)
-      end ),
+    | {o: $m.offset, r:
+      ( if   (attrs_ok($attrs) | not)   then ["drop", $kind, "badattrs", $body]
+        elif ($body | length) == 0      then ["near", $kind, "empty", ($attrs | dash)]
+        elif (EXAMPLES | index($body))  then ["drop", $kind, "example", $body]
+        elif $fenced                    then ["drop", $kind, "fenced", $body]
+        else ["item", $kind, (step_of($attrs) | dash), ($warn | dash), ($body[0:MAXLOG]),
+                (terminal_of($attrs) | dash)] + (if id_of($attrs) == "" then [] else [id_of($attrs)] end)
+        end )} ]
+    + [ $fences[]
+      | . as $f
+      | ($f.inner | match(QUEUE_FENCE_RE)) as $q
+      | cap($q; "info") as $info
+      | cap($q; "body") as $raw
+      | ($raw | sub("^\\s+"; "") | sub("\\s+$"; "")) as $body
+      | ( [ (if ($raw | length) > MAXLOG then "truncated" else empty end),
+            (if is_prose($body) then "prose" else empty end)
+          ] | join(",") ) as $warn
+      | {o: $f.s, r:
+        ( if   (fattrs_ok($info) | not)  then ["drop", "command", "badattrs", $body]
+          elif ($body | length) == 0     then ["near", "command", "empty", ($info | sub("^\\s+"; "") | dash)]
+          elif (EXAMPLES | index($body)) then ["drop", "command", "example", $body]
+          else ["item", "command", (fattr($info; "step") | dash), ($warn | dash), ($body[0:MAXLOG]),
+                  (fattr($info; "terminal") | dash)]
+                + (if fattr($info; "id") == "" then [] else [fattr($info; "id")] end)
+          end )} ]
+    | sort_by(.o) | .[].r ),
   # Report only the opens that no match consumed, by offset. Counting opens against
   # matches would re-report tags that parsed fine alongside a genuinely unclosed one.
   ( [ $msg

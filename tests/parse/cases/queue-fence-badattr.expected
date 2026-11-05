@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/dev/x
+drop	command	badattrs	ls /tmp
+drop	command	badattrs	ls /var
+stat	opens=0	closes=0	matched=0	fences=2	bytes=67

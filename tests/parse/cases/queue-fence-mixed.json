@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "first <user_command step=\"1\">ls /tmp</user_command>\n\n```bash\necho not-a-command\n```\n\n```queue step=2\ndf -h\n```\n\nlast <user_command step=\"3\">uptime</user_command>"
+}

@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "```queue id=crew-close step=2 terminal=ssh:host\ncrew close review-queue-cleanup --force\n```\n\n```queue id=\"run\" step=\"2a\" terminal=\"tmux:main:1\"\necho hi\n```"
+}
