@@ -1,0 +1,5 @@
+ctx	s1	/home/deetss/dev/x
+item	command	1	-	ls /tmp	-
+item	command	2	-	df -h	-
+item	command	3	-	uptime	-
+stat	opens=2	closes=2	matched=2	fences=2	bytes=161

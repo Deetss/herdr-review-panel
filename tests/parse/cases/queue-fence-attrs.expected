@@ -1,0 +1,4 @@
+ctx	s1	/home/deetss/dev/x
+item	command	2	-	crew close review-queue-cleanup --force	ssh:host	crew-close
+item	command	2a	-	echo hi	tmux:main:1	run
+stat	opens=0	closes=0	matched=0	fences=2	bytes=155

@@ -1,0 +1,5 @@
+{
+  "session_id": "s1",
+  "cwd": "/home/deetss/dev/x",
+  "last_assistant_message": "```queue color=red\nls /tmp\n```\n\n```queue id=\"has space\"\nls /var\n```"
+}

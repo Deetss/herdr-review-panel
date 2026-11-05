@@ -41,6 +41,22 @@ replies:
   tmux is tagged automatically with its pane (`tmux display-message -p '#S:#I'`); outside
   tmux with no explicit `terminal=`, it carries no location at all.
 
+The preferred way to flag a command is a fenced code block whose info string starts with
+`queue`. It renders cleanly in the chat and wraps well, where an inline tag shows as raw text.
+The trimmed body, which may span several lines, is the command, and the rest of the info
+string takes optional `id=`, `step=` and `terminal=` attributes (bare or `"quoted"` values,
+same value rules as the tags):
+
+````
+```queue id=crew-close step=2 terminal=ssh:host
+crew close review-queue-cleanup --force
+```
+````
+
+An unknown or malformed attribute drops the item. Every other fence still hides any tags
+inside it. The `<user_command>` tag stays supported and behaves as before, and both forms in
+one reply keep message order.
+
 Either tag takes `id="name"` (letters, digits, `.`, `_`, `-`, up to 32). A later item in the
 same session with the same id **supersedes** the earlier one, so an agent that regenerates a
 file or revises a command swaps the stale row instead of stacking a second one. A later item
