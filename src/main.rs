@@ -4,6 +4,7 @@ mod cleared;
 mod done;
 mod events;
 mod log;
+mod queue;
 mod theme;
 mod ui;
 
@@ -56,7 +57,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_poll = Instant::now();
     loop {
         let size = terminal.size()?;
-        app.set_visible_height(size.height.saturating_sub(3) as usize);
+        app.set_visible_height(ui::body_height(size.height));
         terminal.draw(|frame| areas = Some(ui::draw(frame, app)))?;
 
         let mut force_poll = false;
@@ -93,9 +94,9 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                         KeyCode::Enter => app.activate_cursor(),
                         KeyCode::Char(' ') | KeyCode::Char('d') => app.toggle_done_cursor(),
                         KeyCode::Backspace | KeyCode::Delete => app.clear_cursor(),
-                        // Shifted, because clearing everything from a stray keypress is not
-                        // recoverable. The mouse route has a dedicated button; this is its only
-                        // keyboard equivalent, which keyboard-only remote clients need.
+                        KeyCode::Char('c') => app.clear_done(),
+                        // Shifted so a stray keypress does not hide the whole queue. The mouse
+                        // route has a dedicated button; this is its keyboard equivalent.
                         KeyCode::Char('C') => app.click_clear_all(),
                         KeyCode::Esc | KeyCode::Char('q') => app.click_close(),
                         _ => {}

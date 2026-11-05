@@ -76,9 +76,26 @@ pub enum Row {
         /// Timestamp of the newest row in the group, "YYYY-MM-DD HH:MM:SS".
         ts: String,
         repo: String,
-        // Read by the hidden view's per-session restore in a later phase.
-        #[cfg_attr(not(test), allow(dead_code))]
         session: String,
+        /// Keys of every row in the session, open and done, so hiding the header can reach
+        /// rows that are folded out of view.
+        keys: Vec<String>,
+    },
+    /// An OPEN or DONE section label. `label` carries the count, e.g. "DONE (4)".
+    Section {
+        label: String,
+    },
+    /// A dim one-line placeholder such as "Nothing open.".
+    Note(String),
+    /// One line per session that has done rows. `group` identifies the session for the
+    /// expand/fold state and `keys` are its done rows.
+    Summary {
+        group: String,
+        repo: String,
+        /// Timestamp of the session's newest done row.
+        ts: String,
+        keys: Vec<String>,
+        expanded: bool,
     },
     /// `key` identifies this exact log entry for the done and cleared logs.
     FileItem {
@@ -362,11 +379,20 @@ fn group_by_session(items: Vec<(&ParsedLine, Row)>) -> Vec<Row> {
     groups.sort_by(|a, b| a.newest.cmp(&b.newest));
     let mut out = Vec::new();
     for group in groups {
+        let keys = group
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::FileItem { key, .. } | Row::CommandItem { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
         out.push(Row::Blank);
         out.push(Row::GroupHeader {
             ts: group.newest,
             repo: group.repo,
             session: group.session,
+            keys,
         });
         out.extend(group.rows);
     }

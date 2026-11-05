@@ -3,10 +3,96 @@ use crate::log::Row;
 use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 const CLEAR_ALL_LABEL: &str = "clear";
+/// Rows reserved at the bottom for key hints.
+const FOOTER_ROWS: u16 = 2;
+/// Top inset, header and divider above the body.
+const CHROME_ROWS: u16 = 3;
+
+/// Rows the body gets in a terminal `total_height` rows tall.
+pub fn body_height(total_height: u16) -> usize {
+    total_height.saturating_sub(CHROME_ROWS + FOOTER_ROWS) as usize
+}
+
+/// The header counts, shortened to fit `room` columns: the "Queue: " prefix goes first, then
+/// the done count, then the text is cut with an ellipsis.
+fn header_counts(open: usize, done: usize, room: usize) -> String {
+    let candidates = [
+        format!("Queue: {open} open \u{b7} {done} done"),
+        format!("{open} open \u{b7} {done} done"),
+        format!("{open} open"),
+    ];
+    match candidates.iter().find(|c| c.chars().count() <= room) {
+        Some(fit) => fit.clone(),
+        None => fit(&candidates[2], room, Trim::Tail),
+    }
+}
+
+/// What Enter does on the DONE label's row, shown while the cursor is in the drawer.
+fn done_hint(app: &App) -> Option<&'static str> {
+    match app.cursor.and_then(|c| app.rows.get(c))? {
+        Row::Summary {
+            expanded: false, ..
+        } => Some("Enter: open"),
+        Row::Summary { .. } => Some("Enter: fold"),
+        Row::CommandItem { key, .. } if app.is_done(key) => Some("Enter: fold"),
+        _ => None,
+    }
+}
+
+/// Key hints for whatever the cursor is on, in priority order.
+fn footer_segments(app: &App) -> Vec<&'static str> {
+    const TAIL: [&str; 4] = ["Bksp clear", "c clear done", "H hidden", "S clear session"];
+    if app.rows.is_empty() {
+        return vec!["H hidden", "q close"];
+    }
+    let lead: Option<&'static str> = match app.cursor.and_then(|c| app.rows.get(c)) {
+        Some(Row::CommandItem { key, .. }) if app.is_done(key) => Some("Space reopen"),
+        Some(Row::CommandItem { .. }) => Some("Space done"),
+        Some(Row::FileItem { .. }) => None,
+        Some(Row::Summary {
+            expanded: false, ..
+        }) => Some("Enter open"),
+        Some(Row::Summary { .. }) => Some("Enter fold"),
+        _ => None,
+    };
+    let enter: Option<&'static str> = match app.cursor.and_then(|c| app.rows.get(c)) {
+        Some(Row::CommandItem { key, .. }) if !app.is_done(key) => Some("Enter copy"),
+        Some(Row::FileItem { .. }) => Some("Enter open"),
+        _ => None,
+    };
+    lead.into_iter().chain(TAIL).chain(enter).collect()
+}
+
+/// Fills two rows greedily with ` · ` joined segments. A segment that fits on neither row is
+/// dropped whole, along with every one after it.
+fn footer_rows(segments: &[&str], width: usize) -> [String; 2] {
+    let mut rows = [String::new(), String::new()];
+    let mut r = 0;
+    for seg in segments {
+        loop {
+            let candidate = if rows[r].is_empty() {
+                seg.to_string()
+            } else {
+                format!("{} \u{b7} {seg}", rows[r])
+            };
+            if candidate.chars().count() <= width {
+                rows[r] = candidate;
+                break;
+            }
+            if r == 0 && !rows[0].is_empty() {
+                r = 1;
+                continue;
+            }
+            return rows;
+        }
+    }
+    rows
+}
 /// Content starts here on every item row, so paths and commands share one left edge and the
 /// eye scans one column. Six is the checkbox's own width ("  [ ] "), see CHECKBOX_END_COL.
 const FILE_INDENT: &str = "      ";
@@ -31,12 +117,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         width: raw_area.width.saturating_sub(1),
         height: raw_area.height.saturating_sub(1),
     };
-    // The hint shares the top row with the buttons: in a 45-column split every row of chrome
-    // is a row of queue the user cannot see.
-    let [close_area, divider_area, list_area] = Layout::vertical([
+    let [close_area, divider_area, list_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
+        Constraint::Length(FOOTER_ROWS),
     ])
     .areas(area);
 
@@ -59,41 +144,54 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         theme::clear_all_button()
     };
     let clear_all_width = CLEAR_ALL_LABEL.len() as u16;
-    let clear_all_button = Rect {
+    let clear_slot = Rect {
         x: close_button.x.saturating_sub(2 + clear_all_width),
         y: close_area.y,
         width: clear_all_width,
         height: 1,
     };
-    frame.render_widget(
-        Paragraph::new(Span::styled(CLEAR_ALL_LABEL, clear_all_style)),
-        clear_all_button,
-    );
-
-    // The hint doubles as the mode indicator: the detail view (or the report prompt) replaces
-    // the list below it, and its own key line scrolls out of sight on a long command.
-    let hint = if app.report_prompt_active() {
-        "report? \u{b7} y: yes \u{b7} e: error \u{b7} Esc: not yet"
-    } else if app.detail_text().is_some() {
-        match app.detail_title() {
-            "path" => "full path (copied) \u{b7} Esc/Enter: back",
-            _ => "full command \u{b7} Esc/Enter: back",
-        }
-    } else {
-        "click: open/copy \u{b7} box: done \u{b7} x: clear"
+    // The slot stays reserved when the button is absent, so the counts read the same in the
+    // empty state as in every other one.
+    let has_rows = app.open_count + app.done_count > 0;
+    let clear_all_button = Rect {
+        width: if has_rows { clear_all_width } else { 0 },
+        ..clear_slot
     };
-    // Whatever is left of the row after the buttons and a two-column gap; a narrower pane
-    // just loses the hint's tail rather than colliding with `clear`.
-    let hint_width = clear_all_button.x.saturating_sub(2 + close_area.x);
-    let hint_area = Rect {
+    if has_rows {
+        frame.render_widget(
+            Paragraph::new(Span::styled(CLEAR_ALL_LABEL, clear_all_style)),
+            clear_all_button,
+        );
+    }
+
+    // The detail view and the report prompt replace the list below, so the header row names
+    // the mode; otherwise it carries the counts.
+    let left_width = clear_slot.x.saturating_sub(2 + close_area.x);
+    let left_area = Rect {
         x: close_area.x,
         y: close_area.y,
-        width: hint_width,
+        width: left_width,
         height: 1,
     };
-    // Drop whole segments rather than cutting mid-word: "box: done · x:" teaches nothing.
-    let hint = fit_hint(hint, hint_width as usize);
-    frame.render_widget(Paragraph::new(Span::styled(hint, theme::dim())), hint_area);
+    let mode_hint = if app.report_prompt_active() {
+        Some("report? \u{b7} y: yes \u{b7} e: error \u{b7} Esc: not yet")
+    } else if app.detail_text().is_some() {
+        Some(match app.detail_title() {
+            "path" => "full path (copied) \u{b7} Esc/Enter: back",
+            _ => "full command \u{b7} Esc/Enter: back",
+        })
+    } else {
+        None
+    };
+    let left = match mode_hint {
+        // Drop whole segments rather than cutting mid-word.
+        Some(hint) => Span::styled(fit_hint(hint, left_width as usize), theme::dim()),
+        None => Span::styled(
+            header_counts(app.open_count, app.done_count, left_width as usize),
+            theme::header(),
+        ),
+    };
+    frame.render_widget(Paragraph::new(left), left_area);
 
     let divider = "\u{2500}".repeat(divider_area.width as usize);
     frame.render_widget(
@@ -102,13 +200,22 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     );
 
     let visible = list_area.height as usize;
+    let done_hint = done_hint(app);
     let lines: Vec<Line> = app
         .rows
         .iter()
         .enumerate()
         .skip(app.scroll)
         .take(visible)
-        .map(|(idx, row)| render_row(row, Some(idx) == app.cursor, app, list_area.width))
+        .map(|(idx, row)| {
+            render_row(
+                row,
+                Some(idx) == app.cursor,
+                app,
+                list_area.width,
+                done_hint,
+            )
+        })
         .collect();
     if app.rows.is_empty() {
         frame.render_widget(
@@ -134,6 +241,26 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
             Paragraph::new(Span::styled(status.to_string(), theme::status())),
             status_rect,
         );
+    }
+
+    if mode_hint.is_none() {
+        let [first, second] = footer_rows(&footer_segments(app), area.width as usize);
+        // A one-row footer sits on the last row, leaving the row above blank.
+        let (first, second) = if second.is_empty() {
+            (String::new(), first)
+        } else {
+            (first, second)
+        };
+        for (offset, text) in [first, second].into_iter().enumerate() {
+            let rect = Rect {
+                x: footer_area.x,
+                y: footer_area.y + offset as u16,
+                width: footer_area.width,
+                height: 1,
+            }
+            .intersection(footer_area);
+            frame.render_widget(Paragraph::new(Span::styled(text, theme::dim())), rect);
+        }
     }
 
     let mut report = None;
@@ -288,9 +415,36 @@ fn fit(text: &str, room: usize, trim: Trim) -> String {
     }
 }
 
-fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'static> {
+/// The row's HH:MM, from a "YYYY-MM-DD HH:MM:SS" timestamp.
+fn clock(ts: &str) -> String {
+    ts.get(11..16).unwrap_or(ts).to_string()
+}
+
+/// Columns before the trailing gap and `x`.
+fn content_budget(width: u16) -> usize {
+    (width as usize).saturating_sub(2)
+}
+
+fn render_row(
+    row: &Row,
+    highlighted: bool,
+    app: &App,
+    width: u16,
+    done_hint: Option<&'static str>,
+) -> Line<'static> {
     match row {
         Row::Blank => Line::default(),
+        Row::Section { label } => {
+            let mut spans = vec![Span::styled(label.clone(), theme::section())];
+            if let (true, Some(hint)) = (label.starts_with("DONE"), done_hint) {
+                let used = label.chars().count() + hint.chars().count();
+                let gap = (width as usize).saturating_sub(used);
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::styled(hint, theme::dim()));
+            }
+            Line::from(spans)
+        }
+        Row::Note(text) => Line::from(Span::styled(text.clone(), theme::dim())),
         Row::GroupHeader { ts, repo, .. } => {
             let repo_style = if highlighted {
                 theme::header_highlighted()
@@ -298,11 +452,40 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
                 theme::header()
             };
             // Two sessions in one repo share the repo text, so the clock tells them apart.
-            let clock = ts.get(11..16).unwrap_or(ts.as_str()).to_string();
+            // The clock is never cut; the repo gives way first, down to three columns.
+            let clock = clock(ts);
+            let repo_room = content_budget(width)
+                .saturating_sub(1 + clock.chars().count())
+                .max(3);
             let spans = vec![
-                Span::styled(repo.clone(), repo_style),
+                Span::styled(fit(repo, repo_room, Trim::Tail), repo_style),
                 Span::raw(" "),
                 Span::styled(clock, theme::dim()),
+            ];
+            Line::from(with_clear_glyph(spans, width, Trim::Tail))
+        }
+        Row::Summary { repo, ts, keys, .. } => {
+            let count = keys.len();
+            let rows = format!("{count} row{}", if count == 1 { "" } else { "s" });
+            let with_time = format!("{rows}, {}", clock(ts));
+            // 2 for the gap after the repo, 4 for "[x] ".
+            let budget = content_budget(width).saturating_sub(6);
+            let (repo_room, tail) = if repo.chars().count() + with_time.chars().count() <= budget {
+                (repo.chars().count(), with_time)
+            } else if budget >= with_time.chars().count() + 3 {
+                (budget - with_time.chars().count(), with_time)
+            } else {
+                (budget.saturating_sub(rows.chars().count()).max(3), rows)
+            };
+            let (text, box_style) = if highlighted {
+                (theme::summary_highlighted(), theme::summary_highlighted())
+            } else {
+                (theme::dim(), theme::checkbox())
+            };
+            let spans = vec![
+                Span::styled(format!("{}  ", fit(repo, repo_room, Trim::Tail)), text),
+                Span::styled("[x] ", box_style),
+                Span::styled(tail, text),
             ];
             Line::from(with_clear_glyph(spans, width, Trim::Tail))
         }
@@ -344,22 +527,25 @@ fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'stat
             } else {
                 theme::checkbox()
             };
-            let text_style = if done {
-                theme::command_done()
-            } else if highlighted {
-                theme::command_highlighted()
-            } else {
-                theme::command()
+            let text_style = match (done, highlighted) {
+                // The cursor reverses the struck-through style rather than replacing it.
+                (true, true) => theme::command_done().add_modifier(Modifier::REVERSED),
+                (true, false) => theme::command_done(),
+                (false, true) => theme::command_highlighted(),
+                (false, false) => theme::command(),
             };
             let mut spans = vec![Span::raw("  "), Span::styled(checkbox, checkbox_style)];
-            if warn.is_some() {
-                spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
-            }
-            if let Some(terminal) = terminal {
-                spans.push(Span::styled(format!("[{terminal}] "), theme::dim()));
-            }
-            if let Some(step) = step {
-                spans.push(Span::styled(format!("{step}. "), theme::dim()));
+            // A DONE row carries only its command: no warning, terminal or step label.
+            if !done {
+                if warn.is_some() {
+                    spans.push(Span::styled("\u{26a0} ", theme::warn_icon()));
+                }
+                if let Some(terminal) = terminal {
+                    spans.push(Span::styled(format!("[{terminal}] "), theme::dim()));
+                }
+                if let Some(step) = step {
+                    spans.push(Span::styled(format!("{step}. "), theme::dim()));
+                }
             }
             // A ratatui Line cannot contain a newline, so a multiline command is shown on
             // one row with visible break markers. Copying still yields the real text -
@@ -438,5 +624,377 @@ mod tests {
     fn exact_fit_is_left_alone() {
         let spans = with_clear_glyph(vec![Span::raw("abcd")], 6, Trim::Tail);
         assert_eq!(text(&spans), "abcd x");
+    }
+
+    #[test]
+    fn header_counts_drop_the_prefix_then_the_done_count() {
+        assert_eq!(header_counts(4, 4, 29), "Queue: 4 open \u{b7} 4 done");
+        assert_eq!(header_counts(4, 4, 21), "4 open \u{b7} 4 done");
+        assert_eq!(header_counts(4, 4, 8), "4 open");
+        assert_eq!(header_counts(4, 4, 4), "4 o\u{2026}");
+    }
+
+    #[test]
+    fn footer_fills_row_one_then_row_two_and_drops_whole_segments() {
+        let segs = ["Space done", "Bksp clear", "c clear done", "H hidden"];
+        let [a, b] = footer_rows(&segs, 39);
+        assert_eq!(a, "Space done \u{b7} Bksp clear \u{b7} c clear done");
+        assert_eq!(b, "H hidden");
+        let [a, b] = footer_rows(&segs, 23);
+        assert_eq!(a, "Space done \u{b7} Bksp clear");
+        assert_eq!(b, "c clear done \u{b7} H hidden");
+        let [_, b] = footer_rows(&segs, 12);
+        assert_eq!(b, "Bksp clear");
+    }
+
+    mod snapshots {
+        use super::*;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::style::{Color, Modifier};
+        use std::io::Write as _;
+
+        const LOG: &str = "\
+2026-11-04 17:10:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\titem=docker compose up -d
+2026-11-04 17:15:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\titem=docker compose logs
+2026-11-04 17:20:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\titem=curl -s localhost:3000/health
+2026-11-04 17:27:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\tstep=1\titem=systemctl restart orca
+2026-11-04 17:28:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\tstep=2\titem=hyprctl activewindow
+2026-11-05 08:54:00\tsession=sb\trepo=hub\tcwd=/home/d\tkind=command\titem=docker compose ps
+2026-11-05 09:05:00\tsession=sc\trepo=cqc\tcwd=/home/d\tkind=command\titem=cargo build
+2026-11-05 09:07:00\tsession=sc\trepo=cqc\tcwd=/home/d\tkind=command\titem=cargo test
+";
+        const DONE: [&str; 4] = [
+            "2026-11-04 17:10:00|sa|docker compose up -d",
+            "2026-11-04 17:15:00|sa|docker compose logs",
+            "2026-11-04 17:20:00|sa|curl -s localhost:3000/health",
+            "2026-11-05 09:05:00|sc|cargo build",
+        ];
+
+        struct Files {
+            _log: tempfile::NamedTempFile,
+            _done: tempfile::NamedTempFile,
+            _cleared: tempfile::NamedTempFile,
+        }
+
+        fn app_from(log: &str, done: &[&str]) -> (App, Files) {
+            let mut log_file = tempfile::NamedTempFile::new().unwrap();
+            write!(log_file, "{log}").unwrap();
+            log_file.flush().unwrap();
+            let done_file = tempfile::NamedTempFile::new().unwrap();
+            for key in done {
+                crate::done::mark(done_file.path(), key);
+            }
+            let cleared = tempfile::NamedTempFile::new().unwrap();
+            let app = App::with_paths(
+                log_file.path().to_path_buf(),
+                "/home/d".to_string(),
+                done_file.path().to_path_buf(),
+                cleared.path().to_path_buf(),
+            );
+            (
+                app,
+                Files {
+                    _log: log_file,
+                    _done: done_file,
+                    _cleared: cleared,
+                },
+            )
+        }
+
+        fn sample() -> (App, Files) {
+            app_from(LOG, &DONE)
+        }
+
+        fn draw_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+            app.set_visible_height(body_height(height));
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| _ = draw(f, app)).unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        fn rows_of(buf: &Buffer) -> Vec<String> {
+            let area = buf.area;
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        /// Columns `from..to` of a row, counted in characters rather than bytes.
+        fn cols(row: &str, from: usize, to: usize) -> String {
+            row.chars().skip(from).take(to - from).collect()
+        }
+
+        /// A row's text padded so its trailing `x` lands on the drawable width's last column.
+        fn with_x(content: &str, drawable: usize) -> String {
+            let pad = drawable - 1 - content.chars().count();
+            format!("{content}{}x", " ".repeat(pad))
+        }
+
+        fn expand_hub_summary(app: &mut App) {
+            app.cursor = app
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Summary { repo, .. } if repo == "hub"));
+            app.activate_cursor();
+        }
+
+        fn color_hex(color: Color) -> &'static str {
+            match color {
+                Color::Cyan => "#8abeb7",
+                Color::Magenta => "#b294bb",
+                Color::Yellow => "#f0c674",
+                Color::Gray => "#a8aaa9",
+                Color::DarkGray => "#707880",
+                Color::Red => "#cc6666",
+                Color::LightRed => "#ff8c8c",
+                _ => "#d8dadb",
+            }
+        }
+
+        /// Renders the buffer to an SVG with the mockups' stand-in palette and 10 x 20 cells.
+        fn to_svg(buf: &Buffer) -> String {
+            let (w, h) = (buf.area.width as usize, buf.area.height as usize);
+            let mut svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" xml:space=\"preserve\">\n\
+                 <style>text {{ font-family: \"Liberation Mono\", monospace; font-size: 16.6px; }}</style>\n\
+                 <rect width=\"{}\" height=\"{}\" fill=\"#1d1f21\"/>\n\
+                 <rect width=\"{}\" height=\"20\" fill=\"#2a2d30\"/><rect x=\"{}\" width=\"10\" height=\"{}\" fill=\"#2a2d30\"/>\n",
+                w * 10,
+                h * 20,
+                w * 10,
+                h * 20,
+                w * 10,
+                (w - 1) * 10,
+                h * 20
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let cell = &buf[(x as u16, y as u16)];
+                    if cell.modifier.contains(Modifier::REVERSED) {
+                        svg.push_str(&format!(
+                            "<rect x=\"{}\" y=\"{}\" width=\"10\" height=\"20\" fill=\"{}\"/>\n",
+                            x * 10,
+                            y * 20,
+                            color_hex(cell.fg)
+                        ));
+                    }
+                }
+                for x in 0..w {
+                    let cell = &buf[(x as u16, y as u16)];
+                    if cell.symbol() == " " {
+                        continue;
+                    }
+                    let reversed = cell.modifier.contains(Modifier::REVERSED);
+                    let fill = if reversed {
+                        "#1d1f21"
+                    } else {
+                        color_hex(cell.fg)
+                    };
+                    let mut style = format!("fill:{fill};");
+                    if cell.modifier.contains(Modifier::BOLD) {
+                        style.push_str("font-weight:bold;");
+                    }
+                    if cell.modifier.contains(Modifier::DIM) {
+                        style.push_str("opacity:0.6;");
+                    }
+                    if cell.modifier.contains(Modifier::CROSSED_OUT) {
+                        style.push_str("text-decoration:line-through;");
+                    }
+                    svg.push_str(&format!(
+                        "<text x=\"{}\" y=\"{}\" style=\"{}\">{}</text>\n",
+                        x * 10,
+                        y * 20 + 15,
+                        style,
+                        cell.symbol().replace('&', "&amp;").replace('<', "&lt;")
+                    ));
+                }
+            }
+            svg.push_str("</svg>\n");
+            svg
+        }
+
+        /// With `REVIEW_PANEL_CAPTURE_DIR` set, writes each state's SVG for the fidelity gate.
+        fn capture(name: &str, buf: &Buffer) {
+            if let Ok(dir) = std::env::var("REVIEW_PANEL_CAPTURE_DIR") {
+                std::fs::write(format!("{dir}/{name}.svg"), to_svg(buf)).unwrap();
+            }
+        }
+
+        #[test]
+        fn default_state_at_40_columns() {
+            let (mut app, _files) = sample();
+            let buf = draw_buffer(&mut app, 40, 24);
+            capture("default-40", &buf);
+            let rows = rows_of(&buf);
+            let w = 39;
+            assert_eq!(rows[0].trim(), "");
+            assert!(rows[1].starts_with("Queue: 4 open \u{b7} 4 done"));
+            assert_eq!(cols(&rows[1], 31, 36), "clear");
+            assert_eq!(rows[1].chars().nth(38), Some("x".chars().next().unwrap()));
+            assert_eq!(rows[2].trim_end(), "\u{2500}".repeat(w));
+            assert_eq!(rows[3].trim_end(), "OPEN");
+            assert_eq!(rows[4].trim_end(), with_x("hub 17:28", w));
+            assert_eq!(
+                rows[5].trim_end(),
+                with_x("  [ ] 1. systemctl restart orca", w)
+            );
+            assert_eq!(
+                rows[6].trim_end(),
+                with_x("  [ ] 2. hyprctl activewindow", w)
+            );
+            assert_eq!(rows[7].trim_end(), with_x("hub 08:54", w));
+            assert_eq!(rows[8].trim_end(), with_x("  [ ] docker compose ps", w));
+            assert_eq!(rows[9].trim_end(), with_x("cqc 09:07", w));
+            assert_eq!(rows[10].trim_end(), with_x("  [ ] cargo test", w));
+            assert_eq!(rows[11].trim_end(), "");
+            assert_eq!(rows[12].trim_end(), "DONE (4)");
+            assert_eq!(rows[13].trim_end(), with_x("hub  [x] 3 rows, 17:20", w));
+            assert_eq!(rows[14].trim_end(), with_x("cqc  [x] 1 row, 09:05", w));
+            assert_eq!(
+                rows[22].trim_end(),
+                "Space done \u{b7} Bksp clear \u{b7} c clear done"
+            );
+            assert_eq!(
+                rows[23].trim_end(),
+                "H hidden \u{b7} S clear session \u{b7} Enter copy"
+            );
+            // The cursor starts on the newest open row, with its box and command reversed.
+            assert!(buf[(2, 10)].modifier.contains(Modifier::REVERSED));
+            assert!(buf[(6, 10)].modifier.contains(Modifier::REVERSED));
+            assert!(!buf[(38, 10)].modifier.contains(Modifier::REVERSED));
+        }
+
+        #[test]
+        fn done_expanded_state_at_40_columns() {
+            let (mut app, _files) = sample();
+            expand_hub_summary(&mut app);
+            let buf = draw_buffer(&mut app, 40, 24);
+            capture("expanded-40", &buf);
+            let rows = rows_of(&buf);
+            let w = 39;
+            assert_eq!(
+                rows[12].trim_end(),
+                format!("{:<28}Enter: fold", "DONE (4)")
+            );
+            assert_eq!(rows[13].trim_end(), with_x("hub  [x] 3 rows, 17:20", w));
+            assert_eq!(rows[14].trim_end(), with_x("  [x] docker compose up -d", w));
+            assert_eq!(rows[15].trim_end(), with_x("  [x] docker compose logs", w));
+            assert_eq!(
+                rows[16].trim_end(),
+                with_x("  [x] curl -s localhost:3000/health", w)
+            );
+            assert_eq!(rows[17].trim_end(), with_x("cqc  [x] 1 row, 09:05", w));
+            assert!(buf[(6, 14)].modifier.contains(Modifier::CROSSED_OUT));
+            assert!(buf[(0, 13)].modifier.contains(Modifier::REVERSED));
+            assert!(!buf[(38, 13)].modifier.contains(Modifier::REVERSED));
+            assert_eq!(
+                rows[22].trim_end(),
+                "Enter fold \u{b7} Bksp clear \u{b7} c clear done"
+            );
+            assert_eq!(rows[23].trim_end(), "H hidden \u{b7} S clear session");
+        }
+
+        #[test]
+        fn empty_state_at_40_columns() {
+            let (mut app, _files) = app_from("", &[]);
+            let buf = draw_buffer(&mut app, 40, 24);
+            capture("empty-40", &buf);
+            let rows = rows_of(&buf);
+            assert_eq!(
+                rows[1].trim_end(),
+                format!("{:<38}x", "Queue: 0 open \u{b7} 0 done")
+            );
+            assert_eq!(rows[3].trim_end(), "Nothing to review.");
+            assert_eq!(rows[23].trim_end(), "H hidden \u{b7} q close");
+            assert!(rows.iter().all(|r| !r.contains("clear")));
+        }
+
+        #[test]
+        fn open_empty_with_done_rows_shows_the_note_then_the_drawer() {
+            let (mut app, _files) = app_from(
+                LOG,
+                &[
+                    "2026-11-04 17:10:00|sa|docker compose up -d",
+                    "2026-11-04 17:15:00|sa|docker compose logs",
+                    "2026-11-04 17:20:00|sa|curl -s localhost:3000/health",
+                    "2026-11-04 17:27:00|sa|systemctl restart orca",
+                    "2026-11-04 17:28:00|sa|hyprctl activewindow",
+                    "2026-11-05 08:54:00|sb|docker compose ps",
+                    "2026-11-05 09:05:00|sc|cargo build",
+                    "2026-11-05 09:07:00|sc|cargo test",
+                ],
+            );
+            let buf = draw_buffer(&mut app, 40, 24);
+            let rows = rows_of(&buf);
+            assert_eq!(rows[3].trim_end(), "OPEN");
+            assert_eq!(rows[4].trim_end(), "Nothing open.");
+            // The cursor starts on the first summary, so the DONE label carries its hint.
+            assert_eq!(rows[6].trim_end(), format!("{:<28}Enter: open", "DONE (8)"));
+        }
+
+        #[test]
+        fn default_state_at_32_columns_keeps_every_x() {
+            let (mut app, _files) = sample();
+            let buf = draw_buffer(&mut app, 32, 24);
+            capture("default-32", &buf);
+            let rows = rows_of(&buf);
+            let w = 31;
+            assert!(rows[1].starts_with("4 open \u{b7} 4 done"));
+            assert_eq!(cols(&rows[1], 23, 28), "clear");
+            assert_eq!(
+                rows[5].trim_end(),
+                with_x("  [ ] 1. systemctl restart o\u{2026}", w)
+            );
+            assert_eq!(
+                rows[6].trim_end(),
+                with_x("  [ ] 2. hyprctl activewindow", w)
+            );
+            for y in [4, 5, 6, 7, 8, 9, 10, 13, 14] {
+                assert_eq!(buf[(30, y)].symbol(), "x", "row {y} lost its x");
+            }
+            assert_eq!(rows[22].trim_end(), "Space done \u{b7} Bksp clear");
+            assert_eq!(rows[23].trim_end(), "c clear done \u{b7} H hidden");
+        }
+
+        #[test]
+        fn done_expanded_state_at_32_columns() {
+            let (mut app, _files) = sample();
+            expand_hub_summary(&mut app);
+            let buf = draw_buffer(&mut app, 32, 24);
+            capture("expanded-32", &buf);
+            let rows = rows_of(&buf);
+            let w = 31;
+            assert_eq!(
+                rows[12].trim_end(),
+                format!("{:<20}Enter: fold", "DONE (4)")
+            );
+            assert_eq!(
+                rows[16].trim_end(),
+                with_x("  [x] curl -s localhost:3000\u{2026}", w)
+            );
+            for y in [13, 14, 15, 16, 17] {
+                assert_eq!(buf[(30, y)].symbol(), "x", "row {y} lost its x");
+            }
+            assert_eq!(rows[22].trim_end(), "Enter fold \u{b7} Bksp clear");
+            assert_eq!(rows[23].trim_end(), "c clear done \u{b7} H hidden");
+        }
+
+        #[test]
+        fn empty_state_at_32_columns_uses_the_narrow_header() {
+            let (mut app, _files) = app_from("", &[]);
+            let buf = draw_buffer(&mut app, 32, 24);
+            capture("empty-32", &buf);
+            let rows = rows_of(&buf);
+            assert_eq!(
+                rows[1].trim_end(),
+                format!("{:<30}x", "0 open \u{b7} 0 done")
+            );
+            assert_eq!(rows[3].trim_end(), "Nothing to review.");
+        }
     }
 }

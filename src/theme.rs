@@ -90,6 +90,20 @@ pub fn warn_icon() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// The OPEN and DONE labels.
+pub fn section() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The cursor on a DONE summary line: the whole text reverses, the trailing x does not.
+pub fn summary_highlighted() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::REVERSED)
+}
+
 pub fn clear_all_button() -> Style {
     Style::default().fg(Color::Red)
 }

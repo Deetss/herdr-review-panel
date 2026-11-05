@@ -6,12 +6,16 @@ commands only you should run. Flag either in a reply and they show up in a split
 click, copy, check off, and clear.
 
 ```
-click: open/copy · box: done · x: clear                                       clear  x
+Queue: 3 open · 1 done                                                        clear  x
 ─────────────────────────────────────────────────────────────────────────────────────
+OPEN
 my-project 13:23                                                                    x
       /home/me/my-project/etc/fail2ban/jail.local                                   x
-  [ ] 2a. sudo systemctl enable --now fail2ban                                      x
-  [x] echo "ok" >> ~/.ssh/authorized_keys                                           x
+  [ ] 1. sudo systemctl enable --now fail2ban                                       x
+  [ ] 2. sudo systemctl status fail2ban                                             x
+
+DONE (1)
+my-project  [x] 1 row, 13:20                                                        x
 ```
 
 ## Why
@@ -74,8 +78,8 @@ hook at its own 10s budget with no trace.
 
 When you're done with a group (or the whole queue), the panel asks whether it all went well
 and, on "yes," tells the agent that flagged it to continue via `orca terminal send`, so
-nobody has to go back and prompt it by hand. The top `clear` button hides the queue without
-telling the agent anything at all.
+nobody has to go back and prompt it by hand. The top `clear` button hides every open and done
+row without telling the agent anything, and the panel stays open on the empty state.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
 reply) and read `~/.claude/review-debug.log`.
@@ -85,17 +89,23 @@ reply) and read `~/.claude/review-debug.log`.
 | Action | Mouse | Keyboard |
 |---|---|---|
 | Open a file / copy a command (copying also checks it off) | Click its text | `Enter` |
-| Check a command off | Click its checkbox | `Space` or `d` |
+| Check a command off, or reopen a done one | Click its checkbox | `Space` or `d` |
+| Expand or fold a session's done rows | Click its DONE summary line | `Enter` on the summary |
 | Clear one row | Click the `x` on its row | `Backspace`/`Delete` |
 | Clear a whole session | Click the `x` on its header | `Backspace`/`Delete` on the header |
+| Clear every done row | Click the `x` on a DONE summary (one session) | `c` |
 | Clear everything | Click `clear` (top) | `C` |
 | Close the panel | Click `x` (top) | `Esc` or `q` |
 | Clear does not notify the agent - it only hides the queue. Confirming the finished queue does. | - | - |
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
 
-Rows group by session, one header per session showing its repo and the time of its newest
-row, with the most recent session last. Checking a command off keeps it visible in its
-session, struck through, and unchecking it reopens it. Clearing hides a row from the panel.
+The header shows the open and done counts. The body is an OPEN list, one header per session
+with its repo and the time of its newest open row (most recent session last), then a DONE
+drawer with one summary line per session, collapsed by default. A step label (`1.`) only shows
+when another open row in the same session has one. Checking a command off moves it to the
+drawer, and expanding the summary shows it struck through. Unchecking reopens it. Clearing
+hides a row from the panel. Two footer rows show the keys for whatever the cursor is on.
+The panel starts with the cursor on the newest open row.
 
 ## Where state lives
 
@@ -116,7 +126,7 @@ worktree, and falls back to VS Code, then `xdg-open` on its directory, otherwise
 Orca Mobile mirrors terminals, so the panel is already on your phone. It is fully
 keyboard-drivable for clients without a mouse: arrows, Enter, Space, Escape and Backspace
 cover navigate / activate / mark done / close / clear one row, and `C` clears the whole
-queue (shifted, because there is no undo). Activating a command row also opens it
+queue (shifted, so a stray keypress does not hide it). Activating a command row also opens it
 full-screen, which is the only way to read a long command where OSC-52 clipboard copy
 cannot reach.
 
@@ -187,7 +197,8 @@ Requires a Rust toolchain (stable) and [Orca](https://www.onorca.dev) for the li
 
 ```bash
 cargo build --release   # produces target/release/review-panel, which plugin.sh launches
-cargo test              # unit tests covering log parsing/grouping and app state
+cargo test              # unit tests covering log parsing/grouping, app state and panel layout
+# REVIEW_PANEL_CAPTURE_DIR=<dir> cargo test also writes each layout state as an SVG there
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 

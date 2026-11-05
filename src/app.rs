@@ -2,6 +2,7 @@ use crate::actions;
 use crate::cleared;
 use crate::done;
 use crate::log::{self, ParsedLine, Row};
+use crate::queue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -35,9 +36,17 @@ pub const CHECKBOX_END_COL: u16 = 6;
 pub const WHEEL_SCROLL_LINES: isize = 3;
 
 pub struct App {
-    /// The visible rows, grouped by session. Rebuilt from `entries` whenever the log or a
-    /// mark file changes.
+    /// The panel body: OPEN sessions, then the DONE drawer. Rebuilt from `entries` whenever
+    /// the log, a mark file or the drawer's expansion changes.
     pub rows: Vec<Row>,
+    /// Visible log rows grouped by session, before the OPEN/DONE split.
+    log_rows: Vec<Row>,
+    /// Sessions whose done rows are shown under their summary line. View state only.
+    expanded: HashSet<String>,
+    pub open_count: usize,
+    pub done_count: usize,
+    /// Set once the first frame has reported the real body height.
+    sized: bool,
     /// Rows hidden by a `hide` event or by supersession, kept for the hidden view.
     #[cfg_attr(not(test), allow(dead_code))]
     hidden_rows: Vec<Row>,
@@ -113,6 +122,11 @@ impl App {
         let offset = log::poll_tail(&log_path, 0, &mut entries);
         let mut app = App {
             rows: Vec::new(),
+            log_rows: Vec::new(),
+            expanded: HashSet::new(),
+            open_count: 0,
+            done_count: 0,
+            sized: false,
             hidden_rows: Vec::new(),
             cursor: None,
             scroll: 0,
@@ -143,11 +157,39 @@ impl App {
 
     /// Re-derives the visible and hidden rows from the entries and the replayed mark files.
     fn rebuild(&mut self) {
+        let old_cursor = self.cursor;
+        let old_identity = old_cursor
+            .and_then(|c| self.rows.get(c))
+            .and_then(queue::identity);
         let rows = log::build_rows(&self.entries, &self.home, &self.cleared);
-        self.rows = rows.visible;
+        self.log_rows = rows.visible;
         self.hidden_rows = rows.hidden;
-        self.cursor = self.cursor.filter(|&c| c < self.rows.len());
+        let body = queue::build_body(&self.log_rows, &self.done, &self.expanded);
+        self.rows = body.rows;
+        self.open_count = body.open;
+        self.done_count = body.done;
+        self.cursor = match (old_cursor, old_identity) {
+            (Some(_), Some(id)) => self
+                .rows
+                .iter()
+                .position(|r| queue::identity(r).as_deref() == Some(id.as_str()))
+                .or_else(|| self.nearest_target(old_cursor.unwrap_or(0))),
+            (Some(c), None) => Some(c).filter(|&c| c < self.rows.len()),
+            (None, _) => None,
+        };
         self.ensure_cursor_visible();
+    }
+
+    /// The target at or before `idx`, else the first one after it. Where the cursor lands
+    /// when its row moved out of view, e.g. a command just marked done.
+    fn nearest_target(&self, idx: usize) -> Option<usize> {
+        let targets: Vec<usize> = self.activatable_rows().collect();
+        targets
+            .iter()
+            .rev()
+            .find(|&&t| t <= idx)
+            .or_else(|| targets.first())
+            .copied()
     }
 
     /// Polls the log for newly-appended lines and reloads the done/cleared marks files, so
@@ -184,7 +226,11 @@ impl App {
     /// single frame and silently undo any independent scroll-wheel movement.
     pub fn set_visible_height(&mut self, height: usize) {
         let height = height.max(1);
-        if height != self.visible_height {
+        if !self.sized {
+            self.sized = true;
+            self.visible_height = height;
+            self.default_scroll();
+        } else if height != self.visible_height {
             self.visible_height = height;
             self.ensure_cursor_visible();
         }
@@ -283,9 +329,11 @@ impl App {
     fn toggle_done(&mut self, key: &str) {
         if self.done.contains(key) {
             self.unmark_done(key);
-            return;
+        } else {
+            self.confirm_done(key);
         }
-        self.confirm_done(key);
+        // A done row changes sections, so the body is re-derived.
+        self.rebuild();
     }
 
     pub fn report_prompt_active(&self) -> bool {
@@ -321,7 +369,7 @@ impl App {
     /// checkbox, so only an explicit clear closes those out).
     fn all_commands_done(&self) -> bool {
         let mut has_command = false;
-        let all_done = self.rows.iter().all(|row| match row {
+        let all_done = self.log_rows.iter().all(|row| match row {
             Row::CommandItem { key, .. } => {
                 has_command = true;
                 self.done.contains(key)
@@ -331,10 +379,8 @@ impl App {
         has_command && all_done
     }
 
-    /// Finds the range of rows belonging to the same group as `idx` - the nearest preceding
-    /// GroupHeader through to the next Blank/GroupHeader - the same boundary clear_row_at's
-    /// GroupHeader branch already walks, just in both directions from an item instead of
-    /// forward from the header itself.
+    /// Finds the open rows of the session that owns `idx`: from the nearest preceding
+    /// GroupHeader through to the first row that is not an item.
     fn group_range(&self, idx: usize) -> Option<(usize, usize)> {
         let start = self.rows[..idx]
             .iter()
@@ -342,7 +388,7 @@ impl App {
             + 1;
         let end = self.rows[start..]
             .iter()
-            .position(|r| matches!(r, Row::Blank | Row::GroupHeader { .. }))
+            .position(|r| !matches!(r, Row::FileItem { .. } | Row::CommandItem { .. }))
             .map(|i| start + i)
             .unwrap_or(self.rows.len());
         Some((start, end))
@@ -400,14 +446,51 @@ impl App {
         }
     }
 
+    /// Rows the keyboard cursor can land on. Session headers are reachable by mouse only.
     fn activatable_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.rows.iter().enumerate().filter_map(|(i, r)| {
-            matches!(r, Row::FileItem { .. } | Row::CommandItem { .. }).then_some(i)
+            matches!(
+                r,
+                Row::FileItem { .. } | Row::CommandItem { .. } | Row::Summary { .. }
+            )
+            .then_some(i)
         })
     }
 
+    /// Index of the DONE label, if the drawer exists.
+    fn done_label(&self) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label.starts_with("DONE")))
+    }
+
+    /// The newest open row, or the first DONE summary when nothing is open.
     fn jump_to_latest(&mut self) {
-        self.cursor = self.activatable_rows().last();
+        let open_end = self.done_label().unwrap_or(self.rows.len());
+        self.cursor = self
+            .activatable_rows()
+            .take_while(|&i| i < open_end)
+            .last()
+            .or_else(|| self.activatable_rows().next());
+        self.default_scroll();
+    }
+
+    /// The smallest scroll offset that shows the cursor and, when both fit, the DONE label.
+    fn default_scroll(&mut self) {
+        let height = self.visible_height;
+        let Some(cursor) = self.cursor else {
+            self.scroll = 0;
+            return;
+        };
+        let mut scroll = (cursor + 1).saturating_sub(height);
+        if let Some(label) = self.done_label() {
+            let both = cursor.max(label) + 1;
+            let candidate = both.saturating_sub(height);
+            if candidate <= cursor.min(label) {
+                scroll = candidate;
+            }
+        }
+        self.scroll = scroll;
         self.ensure_cursor_visible();
     }
 
@@ -449,12 +532,26 @@ impl App {
     /// Enter (keyboard) or a click past the checkbox column (mouse): open a file, copy a
     /// command. Mirrors click_row's non-checkbox branch for whichever row the cursor is on.
     pub fn activate_cursor(&mut self) {
-        if let Some(activation) = self
-            .cursor
-            .and_then(|c| self.rows.get(c))
-            .and_then(plan_activation)
-        {
-            self.run_activation(activation);
+        if let Some(idx) = self.cursor {
+            self.activate_row(idx);
+        }
+    }
+
+    fn activate_row(&mut self, idx: usize) {
+        match self.rows.get(idx) {
+            Some(Row::Summary { group, .. }) => {
+                let group = group.clone();
+                if !self.expanded.remove(&group) {
+                    self.expanded.insert(group);
+                }
+                self.rebuild();
+            }
+            Some(row) => {
+                if let Some(activation) = plan_activation(row) {
+                    self.run_activation(activation);
+                }
+            }
+            None => {}
         }
     }
 
@@ -485,18 +582,30 @@ impl App {
                     self.mark_cleared(&key);
                 }
             }
-            Some(Row::GroupHeader { .. }) => {
-                let keys: Vec<String> = self.rows[idx + 1..]
-                    .iter()
-                    .take_while(|r| !matches!(r, Row::Blank | Row::GroupHeader { .. }))
-                    .filter_map(row_key)
-                    .map(str::to_string)
-                    .collect();
-                for key in keys {
+            Some(Row::GroupHeader { keys, .. } | Row::Summary { keys, .. }) => {
+                for key in keys.clone() {
                     self.mark_cleared(&key);
                 }
             }
             _ => return,
+        }
+        self.rebuild();
+        self.jump_to_latest();
+    }
+
+    /// `c`: hides every done row in every session.
+    pub fn clear_done(&mut self) {
+        let keys: Vec<String> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Summary { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for key in keys {
+            self.mark_cleared(&key);
         }
         self.rebuild();
         self.jump_to_latest();
@@ -516,25 +625,29 @@ impl App {
                 let key = key.clone();
                 self.toggle_done(&key);
             }
-            Some(row) => {
-                if let Some(activation) = plan_activation(row) {
-                    self.run_activation(activation);
-                }
-            }
+            Some(_) => self.activate_row(row_idx),
             None => {}
         }
     }
 
-    /// The top "clear" button: appends a `hide` event for every visible row (the logs
-    /// themselves are never cut), then closes the panel the same way click_close does. Does
-    /// not notify the agent.
+    /// The top "clear" button and `C`: appends a `hide` event for every visible row, open and
+    /// done (the logs themselves are never cut). The panel stays open on the empty state.
     pub fn click_clear_all(&mut self) {
-        self.clear_and_close(None);
+        let keys: Vec<String> = self
+            .log_rows
+            .iter()
+            .filter_map(|r| row_key(r).map(str::to_string))
+            .collect();
+        for key in keys {
+            self.mark_cleared(&key);
+        }
+        self.rebuild();
+        self.cursor = None;
+        self.scroll = 0;
     }
 
-    /// Shared by click_clear_all and all_commands_done's auto-trigger: hides the queue,
-    /// optionally notifies the flagging agent (Some(message) only; the clear button sends
-    /// none), then closes the panel the same way click_close does.
+    /// The finish prompt's "yes": hides the queue, notifies the flagging agent, then closes
+    /// the panel the same way click_close does.
     fn clear_and_close(&mut self, notify_message: Option<&str>) {
         actions::clear_all(&self.log_path, &self.cleared_path);
         if let (Some(message), Some(target)) = (notify_message, self.notify_target.as_ref()) {
@@ -572,7 +685,7 @@ impl App {
                 let is_duplicate = self
                     .last_copy
                     .as_ref()
-                    .is_some_and(|(k, at)| k == &key && at.elapsed() < COPY_DEBOUNCE);
+                    .is_some_and(|(_, at)| at.elapsed() < COPY_DEBOUNCE);
                 if is_duplicate {
                     return;
                 }
@@ -590,6 +703,8 @@ impl App {
                     self.detail_title = "command";
                 }
                 self.set_status("Copied to clipboard");
+                // Copying marks the row done, which moves it into the drawer.
+                self.rebuild();
             }
         }
     }
@@ -609,7 +724,11 @@ impl App {
 fn row_key(row: &Row) -> Option<&str> {
     match row {
         Row::FileItem { key, .. } | Row::CommandItem { key, .. } => Some(key),
-        Row::Blank | Row::GroupHeader { .. } => None,
+        Row::Blank
+        | Row::GroupHeader { .. }
+        | Row::Section { .. }
+        | Row::Note(_)
+        | Row::Summary { .. } => None,
     }
 }
 
@@ -677,6 +796,21 @@ mod tests {
         format!("{ts} session=s repo={repo} cwd=/home/d kind=command item={item}\n")
     }
 
+    /// Key of the first command in the log, wherever the body currently shows it.
+    fn first_command_key(app: &App) -> String {
+        app.log_rows
+            .iter()
+            .find_map(|r| match r {
+                Row::CommandItem { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .expect("a command row")
+    }
+
+    fn has_summary(app: &App) -> bool {
+        app.rows.iter().any(|r| matches!(r, Row::Summary { .. }))
+    }
+
     /// Two lines sharing one explicit timestamp, so grouping-dependent tests can't flake on a
     /// second boundary landing between two separate `Local::now()` calls.
     fn two_line_group(repo: &str, item_a: &str, item_b: &str) -> String {
@@ -720,28 +854,31 @@ mod tests {
     fn copying_a_command_marks_it_done_and_persists_it() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         let idx = f.app.cursor.unwrap();
+        let key = first_command_key(&f.app);
         f.app.click_row(idx, CHECKBOX_END_COL + 2, 80); // on the command text: copy
-        let Row::CommandItem { key, .. } = &f.app.rows[idx] else {
-            panic!("expected CommandItem")
-        };
-        assert!(f.app.is_done(key));
-        assert!(done::load(&f.app.done_path).contains(key));
+        assert!(f.app.is_done(&key));
+        assert!(done::load(&f.app.done_path).contains(&key));
         assert_eq!(f.app.status_text(), Some("Copied to clipboard"));
     }
 
     #[test]
     fn a_rapid_duplicate_copy_is_suppressed_but_a_later_one_is_not() {
-        // Two commands, not one - copying the only remaining command would also trigger the
-        // finish prompt (see maybe_prompt_report) and clear `detail`, which isn't what this
-        // test is about.
-        let mut f = fixture(&two_command_group("r", "echo hi", "echo bye"));
-        f.app.cursor = Some(2); // "echo hi"
+        // Three commands, not one or two - copying the last remaining command would also
+        // trigger the finish prompt (see maybe_prompt_report) and clear `detail`, which isn't
+        // what this test is about.
+        let mut f = fixture(&format!(
+            "{}{}{}",
+            now_command_line("r", "echo a"),
+            now_command_line("r", "echo b"),
+            now_command_line("r", "echo c")
+        ));
+        f.app.cursor = Some(2); // "echo a"
         let idx = f.app.cursor.unwrap();
         f.app.click_row(idx, CHECKBOX_END_COL + 2, 80); // first copy
         let first_detail_at = f.app.detail.as_ref().unwrap().1;
 
-        // Immediately duplicate - within COPY_DEBOUNCE, so this should be a no-op and leave
-        // detail's timestamp exactly as the first copy set it.
+        // The copied row left OPEN, so the duplicate lands on the next one. Within
+        // COPY_DEBOUNCE that must be a no-op and leave detail's timestamp as it was.
         f.app.click_row(idx, CHECKBOX_END_COL + 2, 80);
         assert_eq!(f.app.detail.as_ref().unwrap().1, first_detail_at);
 
@@ -758,25 +895,25 @@ mod tests {
     #[test]
     fn toggle_done_marks_a_command_and_persists_it() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
+        let key = first_command_key(&f.app);
         f.app.toggle_done_cursor();
-        let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
-            panic!("expected CommandItem")
-        };
-        assert!(f.app.is_done(key));
-        assert!(done::load(&f.app.done_path).contains(key));
+        assert!(f.app.is_done(&key));
+        assert!(done::load(&f.app.done_path).contains(&key));
     }
 
     #[test]
     fn toggle_done_cursor_marks_then_reopens_with_an_open_event() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
+        let key = first_command_key(&f.app);
         f.app.toggle_done_cursor();
-        let key = {
-            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
         assert!(f.app.is_done(&key));
+        // The row left OPEN; the cursor falls to the drawer's summary, which Enter expands.
+        f.app.activate_cursor();
+        f.app.cursor = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommandItem { .. }));
         f.app.toggle_done_cursor();
         assert!(!f.app.is_done(&key));
         assert!(!done::load(&f.app.done_path).contains(&key));
@@ -792,15 +929,17 @@ mod tests {
     fn unchecking_a_copied_item_untracks_it() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         let idx = f.app.cursor.unwrap();
+        let key = first_command_key(&f.app);
         f.app.click_row(idx, CHECKBOX_END_COL, 80);
-        let key = {
-            let Row::CommandItem { key, .. } = &f.app.rows[idx] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
         assert!(f.app.is_done(&key), "copy should have marked it done");
-        f.app.click_row(idx, 0, 80); // inside the checkbox column
+        f.app.activate_cursor(); // expand the drawer so the done row is clickable
+        let done_idx = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommandItem { .. }))
+            .unwrap();
+        f.app.click_row(done_idx, 0, 80); // inside the checkbox column
         assert!(!f.app.is_done(&key), "checkbox should undo the copy's mark");
     }
 
@@ -841,7 +980,7 @@ mod tests {
         f.app.confirm_report_error();
         assert!(!f.app.report_prompt_active());
         assert!(!f.app.should_quit);
-        assert_eq!(f.app.rows.len(), 3); // header + command + trailing blank
+        assert!(has_summary(&f.app), "the row stays in the DONE drawer");
     }
 
     #[test]
@@ -851,36 +990,76 @@ mod tests {
         f.app.dismiss_report_prompt();
         assert!(!f.app.report_prompt_active());
         assert!(!f.app.should_quit);
-        assert_eq!(f.app.rows.len(), 3);
+        assert!(has_summary(&f.app));
     }
 
     #[test]
-    fn clicking_the_checkbox_column_toggles_done_but_leaves_the_row_in_place() {
+    fn clicking_the_checkbox_column_toggles_done_and_moves_the_row_to_the_drawer() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         let idx = f.app.cursor.unwrap();
+        let key = first_command_key(&f.app);
         f.app.click_row(idx, 0, 80); // inside the checkbox (columns 0..CHECKBOX_END_COL)
-        let Row::CommandItem { key, .. } = &f.app.rows[idx] else {
-            panic!("expected CommandItem")
-        };
-        assert!(f.app.is_done(key));
-        assert_eq!(f.app.rows.len(), 3);
+        assert!(f.app.is_done(&key));
+        assert!(has_summary(&f.app));
+        assert!(
+            !f.app
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::CommandItem { .. }))
+        );
     }
 
     #[test]
-    fn a_done_row_stays_in_its_session_group_after_a_poll() {
+    fn a_done_row_stays_in_the_drawer_after_a_poll() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         f.app.toggle_done_cursor();
         f.app.poll();
-        // Blank, GroupHeader, the one command. No time-based move, no synthetic section.
-        assert_eq!(f.app.rows.len(), 3);
-        assert_eq!(
-            f.app
-                .rows
-                .iter()
-                .filter(|r| matches!(r, Row::GroupHeader { .. }))
-                .count(),
-            1
-        );
+        // OPEN, "Nothing open.", blank, DONE, one summary. No time-based move.
+        assert_eq!(f.app.rows.len(), 5);
+        assert_eq!((f.app.open_count, f.app.done_count), (0, 1));
+    }
+
+    #[test]
+    fn enter_on_a_summary_expands_and_folds_its_done_rows() {
+        let mut f = fixture(&now_command_line("r", "echo hi"));
+        f.app.toggle_done_cursor();
+        let summary = f.app.cursor.unwrap();
+        assert!(matches!(
+            f.app.rows[summary],
+            Row::Summary {
+                expanded: false,
+                ..
+            }
+        ));
+        f.app.activate_cursor();
+        assert_eq!(f.app.cursor, Some(summary));
+        assert!(matches!(
+            f.app.rows[summary],
+            Row::Summary { expanded: true, .. }
+        ));
+        assert!(matches!(f.app.rows[summary + 1], Row::CommandItem { .. }));
+        f.app.activate_cursor();
+        assert_eq!(f.app.rows.len(), summary + 1);
+    }
+
+    #[test]
+    fn c_hides_done_rows_and_keeps_open_ones() {
+        let mut f = fixture(&two_command_group("r", "echo a", "echo b"));
+        f.app.toggle_done_cursor(); // "echo b", the newest
+        f.app.clear_done();
+        assert_eq!((f.app.open_count, f.app.done_count), (1, 0));
+        let hides = std::fs::read_to_string(&f.app.cleared_path).unwrap();
+        assert_eq!(hides.lines().filter(|l| l.contains(" hide ")).count(), 1);
+    }
+
+    #[test]
+    fn the_clear_button_hides_everything_and_leaves_the_panel_open() {
+        let mut f = fixture(&two_command_group("r", "echo a", "echo b"));
+        f.app.toggle_done_cursor();
+        f.app.click_clear_all();
+        assert!(f.app.rows.is_empty());
+        assert!(!f.app.should_quit);
+        assert_eq!(f.app.cursor, None);
     }
 
     #[test]
@@ -899,18 +1078,14 @@ mod tests {
             )
         };
 
-        let key = {
-            let probe = open(&done);
-            let Row::CommandItem { key, .. } = &probe.rows[probe.cursor.unwrap()] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
+        let key = first_command_key(&open(&done));
         done::mark(done.path(), &key);
 
         let app = open(&done);
         assert!(app.is_done(&key));
-        assert_eq!(app.rows.len(), 3);
+        assert!(has_summary(&app));
+        // Nothing is open, so the cursor starts on the drawer's summary line.
+        assert!(matches!(app.rows[app.cursor.unwrap()], Row::Summary { .. }));
     }
 
     #[test]
@@ -927,13 +1102,19 @@ mod tests {
     fn clicking_past_the_checkbox_copies_and_a_second_copy_never_unmarks() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         let idx = f.app.cursor.unwrap();
+        let key = first_command_key(&f.app);
         f.app.click_row(idx, CHECKBOX_END_COL, 80);
-        f.app.click_row(idx, CHECKBOX_END_COL, 80);
-        let Row::CommandItem { key, .. } = &f.app.rows[idx] else {
-            panic!("expected CommandItem")
-        };
+        f.app.activate_cursor(); // expand the drawer
+        let done_idx = f
+            .app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommandItem { .. }))
+            .unwrap();
+        f.app.last_copy = None;
+        f.app.click_row(done_idx, CHECKBOX_END_COL, 80);
         assert!(
-            f.app.is_done(key),
+            f.app.is_done(&key),
             "copying is a one-way done mark, unlike the checkbox toggle"
         );
         assert_eq!(f.app.status_text(), Some("Copied to clipboard"));
@@ -982,10 +1163,9 @@ mod tests {
         let mut f = fixture(&two_line_group("r", "a.txt", "b.txt"));
         f.app.cursor = Some(2); // a.txt
         f.app.clear_cursor();
-        // The header still has an item under it (b.txt), so prune_empty_groups leaves the
-        // Blank+GroupHeader pair in place - only a.txt itself is gone.
+        // The header still has an item under it (b.txt) - only a.txt itself is gone.
         assert_eq!(f.app.rows.len(), 3);
-        assert!(matches!(f.app.rows[0], Row::Blank));
+        assert!(matches!(&f.app.rows[0], Row::Section { label } if label == "OPEN"));
         assert!(matches!(f.app.rows[1], Row::GroupHeader { .. }));
         assert!(matches!(&f.app.rows[2], Row::FileItem { label, .. } if label == "b.txt"));
     }
