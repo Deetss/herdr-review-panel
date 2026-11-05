@@ -841,6 +841,74 @@ mod tests {
         assert_eq!(item_keys(&rows.hidden), ["t1|s1|echo hi"]);
     }
 
+    fn cmd(ts: &str, step: Option<&str>, id: Option<&str>, item: &str) -> ParsedLine {
+        let mut l = line(ts, "s1", "repo", true, step, item);
+        l.id = id.map(str::to_string);
+        l
+    }
+
+    fn visible_items(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r {
+                Row::CommandItem { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reflagged_list_keeps_its_written_order_after_earlier_rows() {
+        let entries = [
+            cmd("2026-11-05 10:09:34", Some("1"), None, "A"),
+            cmd("2026-11-05 10:09:34", Some("2a"), None, "B"),
+            cmd("2026-11-05 10:09:34", Some("2b"), None, "C"),
+            cmd("2026-11-05 10:09:34", Some("2c"), None, "D"),
+            cmd("2026-11-05 10:10:20", Some("1"), Some("console-tests"), "A"),
+            cmd("2026-11-05 10:13:24", None, Some("ghcr-find"), "E"),
+            cmd("2026-11-05 10:14:22", Some("1"), Some("console-tests"), "A"),
+            cmd("2026-11-05 10:14:22", Some("2a"), Some("dokploy-key"), "B"),
+            cmd(
+                "2026-11-05 10:14:22",
+                Some("2b"),
+                Some("dokploy-compose-id"),
+                "C",
+            ),
+            cmd(
+                "2026-11-05 10:14:22",
+                Some("2c"),
+                Some("dokploy-webhook-del"),
+                "D",
+            ),
+        ];
+        let rows = build_rows(&entries, "/home/d", &HashMap::new());
+
+        assert_eq!(visible_items(&rows.visible), ["E", "A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn a_replacement_in_a_later_reply_moves_below_rows_between() {
+        let rows = build(&[
+            cmd("t1", None, None, "echo a"),
+            cmd("t2", None, None, "echo b"),
+            cmd("t3", None, None, "echo a"),
+        ]);
+
+        assert_eq!(visible_items(&rows), ["echo b", "echo a"]);
+    }
+
+    #[test]
+    fn restoring_a_superseded_row_shows_it_at_its_own_position() {
+        let entries = [
+            cmd("t1", None, None, "echo a"),
+            cmd("t2", None, None, "echo b"),
+            cmd("t3", None, None, "echo a"),
+        ];
+        let cleared = HashMap::from([("t1|s1|echo a".to_string(), false)]);
+        let rows = build_rows(&entries, "/home/d", &cleared);
+
+        assert_eq!(visible_items(&rows.visible), ["echo a", "echo b", "echo a"]);
+    }
+
     #[test]
     fn a_show_event_brings_a_superseded_row_back() {
         let entries = [
