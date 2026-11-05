@@ -283,8 +283,9 @@ pub fn resolve_abspath(item: &str, cwd: Option<&str>, home: &str) -> Option<Stri
 /// later row of the same session supersedes it, and visible otherwise.
 pub fn build_rows(entries: &[ParsedLine], home: &str, cleared: &HashMap<String, bool>) -> Rows {
     let superseded = superseded_flags(entries);
+    let slots = chain_slots(entries);
     let (mut visible, mut hidden) = (Vec::new(), Vec::new());
-    for (line, superseded) in entries.iter().zip(superseded) {
+    for (i, (line, superseded)) in entries.iter().zip(superseded).enumerate() {
         let key = line.key();
         let state = match cleared.get(&key) {
             Some(true) => Some(Hidden::Cleared),
@@ -295,13 +296,47 @@ pub fn build_rows(entries: &[ParsedLine], home: &str, cleared: &HashMap<String, 
         if state.is_some() {
             hidden.push((line, row));
         } else {
-            visible.push((line, row));
+            // A restored superseded row sits at its own position, not its chain's.
+            let slot = if superseded { i } else { slots[i] };
+            visible.push((slot, line, row));
         }
     }
+    visible.sort_by_key(|(slot, _, _)| *slot);
     Rows {
-        visible: group_by_session(visible),
+        visible: group_by_session(visible.into_iter().map(|(_, l, r)| (l, r)).collect()),
         hidden: group_by_session(hidden),
     }
+}
+
+/// The position each entry displays at. An entry that supersedes others takes the position of
+/// the oldest entry in its chain, so a re-flagged step keeps its place in the list.
+fn chain_slots(entries: &[ParsedLine]) -> Vec<usize> {
+    let mut slot_of: HashMap<String, usize> = HashMap::new();
+    let mut slots = Vec::with_capacity(entries.len());
+    for (i, line) in entries.iter().enumerate() {
+        let keys = [
+            Some(format!(
+                "{}|{}|{}",
+                line.session,
+                line.kind(),
+                line.raw_item
+            )),
+            line.id
+                .as_ref()
+                .map(|id| format!("{}|id|{id}", line.session)),
+        ];
+        let slot = keys
+            .iter()
+            .flatten()
+            .filter_map(|k| slot_of.get(k).copied())
+            .min()
+            .unwrap_or(i);
+        for k in keys.into_iter().flatten() {
+            slot_of.insert(k, slot);
+        }
+        slots.push(slot);
+    }
+    slots
 }
 
 fn item_row(line: &ParsedLine, key: String, hidden: Option<Hidden>, home: &str) -> Row {
@@ -836,7 +871,7 @@ mod tests {
 
         assert_eq!(
             item_keys(&rows.visible),
-            ["t1|s2|echo hi", "t1|s1|echo other", "t2|s1|echo hi"]
+            ["t1|s2|echo hi", "t2|s1|echo hi", "t1|s1|echo other"]
         );
         assert_eq!(item_keys(&rows.hidden), ["t1|s1|echo hi"]);
     }
@@ -857,56 +892,84 @@ mod tests {
     }
 
     #[test]
-    fn a_reflagged_list_keeps_its_written_order_after_earlier_rows() {
-        let entries = [
-            cmd("2026-11-05 10:09:34", Some("1"), None, "A"),
-            cmd("2026-11-05 10:09:34", Some("2a"), None, "B"),
-            cmd("2026-11-05 10:09:34", Some("2b"), None, "C"),
-            cmd("2026-11-05 10:09:34", Some("2c"), None, "D"),
-            cmd("2026-11-05 10:10:20", Some("1"), Some("console-tests"), "A"),
-            cmd("2026-11-05 10:13:24", None, Some("ghcr-find"), "E"),
-            cmd("2026-11-05 10:14:22", Some("1"), Some("console-tests"), "A"),
-            cmd("2026-11-05 10:14:22", Some("2a"), Some("dokploy-key"), "B"),
-            cmd(
-                "2026-11-05 10:14:22",
-                Some("2b"),
-                Some("dokploy-compose-id"),
-                "C",
-            ),
-            cmd(
-                "2026-11-05 10:14:22",
-                Some("2c"),
-                Some("dokploy-webhook-del"),
-                "D",
-            ),
-        ];
-        let rows = build_rows(&entries, "/home/d", &HashMap::new());
-
-        assert_eq!(visible_items(&rows.visible), ["E", "A", "B", "C", "D"]);
-    }
-
-    #[test]
-    fn a_replacement_in_a_later_reply_moves_below_rows_between() {
+    fn a_re_flagged_step_keeps_its_slot_in_the_list() {
         let rows = build(&[
-            cmd("t1", None, None, "echo a"),
-            cmd("t2", None, None, "echo b"),
-            cmd("t3", None, None, "echo a"),
+            cmd("10:09:34", Some("1"), None, "A"),
+            cmd("10:09:34", Some("2a"), None, "B"),
+            cmd("10:09:34", Some("2b"), None, "C"),
+            cmd("10:09:34", Some("2c"), None, "D"),
+            cmd("10:10:20", Some("1"), Some("console-tests"), "A"),
+            cmd("10:13:24", None, Some("ghcr-find"), "E"),
         ]);
 
-        assert_eq!(visible_items(&rows), ["echo b", "echo a"]);
+        assert_eq!(visible_items(&rows), ["A", "B", "C", "D", "E"]);
     }
 
     #[test]
-    fn restoring_a_superseded_row_shows_it_at_its_own_position() {
+    fn a_whole_list_re_flagged_later_stays_above_rows_between() {
+        let rows = build(&[
+            cmd("t1", Some("1"), None, "A"),
+            cmd("t1", Some("2a"), None, "B"),
+            cmd("t1", Some("2b"), None, "C"),
+            cmd("t1", Some("2c"), None, "D"),
+            cmd("t2", None, Some("ghcr-find"), "E"),
+            cmd("t3", Some("1"), Some("one"), "A"),
+            cmd("t3", Some("2a"), Some("two"), "B"),
+            cmd("t3", Some("2b"), Some("three"), "C"),
+            cmd("t3", Some("2c"), Some("four"), "D"),
+        ]);
+
+        assert_eq!(visible_items(&rows), ["A", "B", "C", "D", "E"]);
+    }
+
+    #[test]
+    fn a_three_step_chain_shows_the_last_row_at_the_first_slot() {
+        let rows = build(&[
+            cmd("t1", None, Some("x"), "X"),
+            cmd("t2", None, None, "other"),
+            cmd("t3", None, Some("x"), "Y"),
+            cmd("t4", None, Some("x"), "Z"),
+        ]);
+
+        assert_eq!(visible_items(&rows), ["Z", "other"]);
+    }
+
+    #[test]
+    fn an_id_change_that_supersedes_nothing_keeps_its_own_position() {
+        let rows = build(&[
+            cmd("t1", None, Some("old"), "A"),
+            cmd("t2", None, None, "B"),
+            cmd("t3", None, Some("new"), "C"),
+        ]);
+
+        assert_eq!(visible_items(&rows), ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn restoring_a_superseded_row_leaves_its_replacement_in_the_chain_slot() {
         let entries = [
-            cmd("t1", None, None, "echo a"),
-            cmd("t2", None, None, "echo b"),
-            cmd("t3", None, None, "echo a"),
+            cmd("t1", None, Some("x"), "X"),
+            cmd("t2", None, None, "other"),
+            cmd("t3", None, Some("x"), "Z"),
         ];
-        let cleared = HashMap::from([("t1|s1|echo a".to_string(), false)]);
+        let cleared = HashMap::from([("t1|s1|X".to_string(), false)]);
         let rows = build_rows(&entries, "/home/d", &cleared);
 
-        assert_eq!(visible_items(&rows.visible), ["echo a", "echo b", "echo a"]);
+        assert_eq!(visible_items(&rows.visible), ["X", "Z", "other"]);
+    }
+
+    #[test]
+    fn restoring_a_middle_row_shows_it_at_its_own_position() {
+        let entries = [
+            cmd("t1", None, Some("x"), "X"),
+            cmd("t2", None, None, "other"),
+            cmd("t3", None, Some("x"), "Y"),
+            cmd("t4", None, Some("x"), "Z"),
+        ];
+        let cleared = HashMap::from([("t3|s1|Y".to_string(), false)]);
+        let rows = build_rows(&entries, "/home/d", &cleared);
+
+        assert_eq!(visible_items(&rows.visible), ["Z", "other", "Y"]);
     }
 
     #[test]
