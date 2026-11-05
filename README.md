@@ -8,7 +8,7 @@ click, copy, check off, and clear.
 ```
 click: open/copy · box: done · x: clear                                       clear  x
 ─────────────────────────────────────────────────────────────────────────────────────
-13:23  my-project                                                                   x
+my-project 13:23                                                                    x
       /home/me/my-project/etc/fail2ban/jail.local                                   x
   [ ] 2a. sudo systemctl enable --now fail2ban                                      x
   [x] echo "ok" >> ~/.ssh/authorized_keys                                           x
@@ -38,11 +38,11 @@ replies:
   tmux with no explicit `terminal=`, it carries no location at all.
 
 Either tag takes `id="name"` (letters, digits, `.`, `_`, `-`, up to 32). A later item in the
-same session with the same id **replaces** the earlier one, so an agent that regenerates a
-file or revises a command swaps the stale row instead of stacking a second one. An exact
-repeat of the same kind and value from the same session replaces too, with no id needed.
-The log stays append-only; replacement happens as rows are built, so a restart converges on
-the same view. Clicking a file row opens it, copies its full path, and shows the path in the
+same session with the same id **supersedes** the earlier one, so an agent that regenerates a
+file or revises a command swaps the stale row instead of stacking a second one. A later item
+of the same kind and value from the same session supersedes too, with no id needed. A
+superseded row is hidden, not deleted. The log stays append-only; supersession is derived
+whenever rows are built, so a restart converges on the same view. Clicking a file row opens it, copies its full path, and shows the path in the
 detail overlay, since a narrow pane only has room for the tail.
 
 Matches get logged to a queue scoped to the Orca tab they came from (`ORCA_TAB_ID`, under
@@ -74,7 +74,7 @@ hook at its own 10s budget with no trace.
 
 When you're done with a group (or the whole queue), the panel asks whether it all went well
 and, on "yes," tells the agent that flagged it to continue via `orca terminal send`, so
-nobody has to go back and prompt it by hand. The top `clear` button wipes the queue without
+nobody has to go back and prompt it by hand. The top `clear` button hides the queue without
 telling the agent anything at all.
 
 To see what the hook decided and why, set `REVIEW_NOTIFY_DEBUG=1` (or `2` to include the raw
@@ -87,14 +87,26 @@ reply) and read `~/.claude/review-debug.log`.
 | Open a file / copy a command (copying also checks it off) | Click its text | `Enter` |
 | Check a command off | Click its checkbox | `Space` or `d` |
 | Clear one row | Click the `x` on its row | `Backspace`/`Delete` |
-| Clear a whole section | Click the `x` on its header | `Backspace`/`Delete` on the header |
-| Clear everything | Click `clear` (top) | - |
+| Clear a whole session | Click the `x` on its header | `Backspace`/`Delete` on the header |
+| Clear everything | Click `clear` (top) | `C` |
 | Close the panel | Click `x` (top) | `Esc` or `q` |
-| Clear does not notify the agent - it only wipes the queue. Confirming the finished queue does. | - | - |
+| Clear does not notify the agent - it only hides the queue. Confirming the finished queue does. | - | - |
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
 
-Checking a command off keeps it visible, struck through. Clearing removes it entirely. Both
-persist across restarts and sync live across multiple open panel instances.
+Rows group by session, one header per session showing its repo and the time of its newest
+row, with the most recent session last. Checking a command off keeps it visible in its
+session, struck through, and unchecking it reopens it. Clearing hides a row from the panel.
+
+## Where state lives
+
+No file is ever truncated, rewritten or pruned. `~/.claude/review.log` holds the flagged items.
+`~/.claude/review-done.log` and `~/.claude/review-cleared.log` hold one event per line,
+`{unix_ts} done|open {key}` and `{unix_ts} hide|show {key}`, and the last event for a key wins.
+A line with no timestamp is a legacy mark and reads as `done` or `hide`. Checking, unchecking
+and clearing append events, so all three persist across restarts and sync live across open
+panel instances. `plugin.sh clear` and the `clear` button append `hide` events and leave
+`review.log` untouched. The files grow without bound by design. There is no time window and no
+sweep of done rows, so `REVIEW_PANEL_WINDOW_MINUTES` no longer exists.
 
 A clicked file opens in Orca's editor (`orca file open`) when it lives inside the current
 worktree, and falls back to VS Code, then `xdg-open` on its directory, otherwise.

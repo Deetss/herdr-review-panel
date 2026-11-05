@@ -291,24 +291,19 @@ fn fit(text: &str, room: usize, trim: Trim) -> String {
 fn render_row(row: &Row, highlighted: bool, app: &App, width: u16) -> Line<'static> {
     match row {
         Row::Blank => Line::default(),
-        Row::GroupHeader { ts, repo } => {
+        Row::GroupHeader { ts, repo, .. } => {
             let repo_style = if highlighted {
                 theme::header_highlighted()
             } else {
                 theme::header()
             };
-            // Empty ts is the sentinel for the synthetic trailing "Completed" section (see
-            // app.rs's sweep_completed) - it has no timestamp of its own, so skip the span
-            // and its gap rather than rendering a blank-then-double-space.
-            let mut spans = Vec::new();
-            if !ts.is_empty() {
-                // The list is a window of the last few minutes, so the date is always today
-                // and only the clock part tells groups apart.
-                let clock = ts.get(11..16).unwrap_or(ts.as_str()).to_string();
-                spans.push(Span::styled(clock, theme::dim()));
-                spans.push(Span::raw("  "));
-            }
-            spans.push(Span::styled(repo.clone(), repo_style));
+            // Two sessions in one repo share the repo text, so the clock tells them apart.
+            let clock = ts.get(11..16).unwrap_or(ts.as_str()).to_string();
+            let spans = vec![
+                Span::styled(repo.clone(), repo_style),
+                Span::raw(" "),
+                Span::styled(clock, theme::dim()),
+            ];
             Line::from(with_clear_glyph(spans, width, Trim::Tail))
         }
         Row::FileItem {

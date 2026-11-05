@@ -13,17 +13,16 @@
 //! `warn=` is only present on commands review-notify.sh's prose heuristic flagged as reading
 //! like a paraphrased task rather than a real shell command.
 //! `id=` is an optional agent-chosen name for the item (<user_review id="audio-ab">). A later
-//! item in the same session with the same id replaces the earlier one in the panel, and so
-//! does an exact repeat of the same kind and value with no id. The log itself stays
-//! append-only; replacement happens as rows are built, so a restart's backfill converges on
-//! the same view.
+//! item in the same session with the same id supersedes the earlier one, and so does a later
+//! item of the same kind and value. The log itself stays append-only; supersession is derived
+//! every time rows are built, so a restart converges on the same view.
 //! `terminal=` names which terminal/pane/SSH session a command targets - either an explicit
 //! <user_command terminal="ssh:host"> attribute, or the auto-detected tmux pane when that
 //! attribute is absent. Absent entirely outside tmux with no explicit override.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub struct ParsedLine {
@@ -50,16 +49,38 @@ pub struct ParsedLine {
     pub raw_item: String,
 }
 
+impl ParsedLine {
+    /// Identifies this exact log entry in the done and cleared logs.
+    fn key(&self) -> String {
+        format!("{}|{}|{}", self.ts, self.session, self.raw_item)
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.is_command { "command" } else { "review" }
+    }
+}
+
+/// Why a row is out of the main queue. Exposed on the row model for the hidden view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hidden {
+    Cleared,
+    Superseded,
+}
+
 /// A single row of the rendered display. Blank and GroupHeader rows are not clickable and
-/// carry no key - they're never individually cleared, only pruned once every item under them
-/// already has been (see app.rs's clear_cursor/prune_empty_groups).
+/// carry no key. One GroupHeader covers one session.
+#[derive(Clone)]
 pub enum Row {
     Blank,
     GroupHeader {
+        /// Timestamp of the newest row in the group, "YYYY-MM-DD HH:MM:SS".
         ts: String,
         repo: String,
+        // Read by the hidden view's per-session restore in a later phase.
+        #[cfg_attr(not(test), allow(dead_code))]
+        session: String,
     },
-    /// `key` identifies this exact log entry for the cleared-marks file - see cleared.rs.
+    /// `key` identifies this exact log entry for the done and cleared logs.
     FileItem {
         label: String,
         abspath: Option<String>,
@@ -67,10 +88,11 @@ pub enum Row {
         /// did not resolve on disk, which used to be dropped silently instead of shown.
         warn: Option<String>,
         key: String,
-        /// Identity across re-flags: a newer row with the same slot replaces this one.
-        slot: String,
+        // Why the row is hidden. Rendered by the hidden view in a later phase.
+        #[cfg_attr(not(test), allow(dead_code))]
+        hidden: Option<Hidden>,
     },
-    /// `key` identifies this exact log entry for the done-marks and cleared-marks files.
+    /// `key` identifies this exact log entry for the done and cleared logs.
     CommandItem {
         command: String,
         step: Option<String>,
@@ -80,9 +102,17 @@ pub enum Row {
         /// Which terminal/pane/SSH session this targets - see `terminal=` in the module doc.
         terminal: Option<String>,
         key: String,
-        /// Identity across re-flags: a newer row with the same slot replaces this one.
-        slot: String,
+        #[cfg_attr(not(test), allow(dead_code))]
+        hidden: Option<Hidden>,
     },
+}
+
+/// The log split by visibility. Both lists are grouped by session, oldest group first.
+pub struct Rows {
+    pub visible: Vec<Row>,
+    // Rendered by the hidden view in a later phase.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub hidden: Vec<Row>,
 }
 
 pub fn parse_line(line: &str) -> Option<ParsedLine> {
@@ -228,157 +258,143 @@ pub fn resolve_abspath(item: &str, cwd: Option<&str>, home: &str) -> Option<Stri
     }
 }
 
-/// Turns one parsed log line into its display row(s), appending to `rows` and tracking
-/// `last_key` across calls so consecutive items sharing a timestamp+repo group under one
-/// header instead of repeating it per item - same rule review-notify.sh's writer follows
-/// (one hook invocation, one timestamp, possibly several flagged items). Skips items already
-/// in `cleared` so a restart's backfill doesn't resurrect something dismissed last session.
-pub fn append_row(
-    rows: &mut Vec<Row>,
-    last_key: &mut Option<(String, String)>,
-    line: &ParsedLine,
-    home: &str,
-    cleared: &HashSet<String>,
-) {
-    let key = (line.ts.clone(), line.repo.clone());
-    let item_key = format!("{}|{}|{}", line.ts, line.session, line.raw_item);
-    if cleared.contains(&item_key) {
-        // Deliberately leave `last_key` untouched: recording this group as "already seen"
-        // would suppress the header for the *next* (non-cleared) item in the same group,
-        // since it would then look like a header was already emitted when it wasn't.
-        return;
+/// Splits `entries` into visible and hidden rows, each grouped by session. A row's cleared-log
+/// event decides first (`hide` hides, `show` shows). With no event, a row is hidden when a
+/// later row of the same session supersedes it, and visible otherwise.
+pub fn build_rows(entries: &[ParsedLine], home: &str, cleared: &HashMap<String, bool>) -> Rows {
+    let superseded = superseded_flags(entries);
+    let (mut visible, mut hidden) = (Vec::new(), Vec::new());
+    for (line, superseded) in entries.iter().zip(superseded) {
+        let key = line.key();
+        let state = match cleared.get(&key) {
+            Some(true) => Some(Hidden::Cleared),
+            Some(false) => None,
+            None => superseded.then_some(Hidden::Superseded),
+        };
+        let row = item_row(line, key, state, home);
+        if state.is_some() {
+            hidden.push((line, row));
+        } else {
+            visible.push((line, row));
+        }
     }
-    // Replace whatever this item supersedes before deciding about a group header: removing
-    // a group's last row prunes its header, so the header decision below must see that.
-    let slot = match &line.id {
-        Some(id) => format!("{}|id|{id}", line.session),
-        None => format!(
-            "{}|{}|{}",
-            line.session,
-            if line.is_command { "command" } else { "review" },
-            line.raw_item
-        ),
-    };
-    let before = rows.len();
-    rows.retain(|r| row_slot(r) != Some(slot.as_str()));
-    if rows.len() != before {
-        prune_empty_groups(rows);
-        *last_key = None;
+    Rows {
+        visible: group_by_session(visible),
+        hidden: group_by_session(hidden),
     }
-    let is_new_group = last_key.as_ref() != Some(&key);
-    if is_new_group {
-        rows.push(Row::Blank);
-        rows.push(Row::GroupHeader {
-            ts: line.ts.clone(),
-            repo: line.repo.clone(),
-        });
-        *last_key = Some(key);
-    }
+}
+
+fn item_row(line: &ParsedLine, key: String, hidden: Option<Hidden>, home: &str) -> Row {
     if line.is_command {
-        rows.push(Row::CommandItem {
+        Row::CommandItem {
             command: line.item.clone(),
             step: line.step.clone(),
             warn: line.warn.clone(),
             terminal: line.terminal.clone(),
-            key: item_key,
-            slot,
-        });
+            key,
+            hidden,
+        }
     } else {
-        let abspath = resolve_abspath(&line.item, line.cwd.as_deref(), home);
-        rows.push(Row::FileItem {
+        Row::FileItem {
             label: line.item.clone(),
-            abspath,
+            abspath: resolve_abspath(&line.item, line.cwd.as_deref(), home),
             warn: line.warn.clone(),
-            key: item_key,
-            slot,
+            key,
+            hidden,
+        }
+    }
+}
+
+/// An entry is superseded when a later entry from the same session has the same `id`, or the
+/// same kind and value. Walking backwards means "later" is just "already seen".
+fn superseded_flags(entries: &[ParsedLine]) -> Vec<bool> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut flags = vec![false; entries.len()];
+    for (i, line) in entries.iter().enumerate().rev() {
+        let by_value = format!("{}|{}|{}", line.session, line.kind(), line.raw_item);
+        let by_id = line
+            .id
+            .as_ref()
+            .map(|id| format!("{}|id|{id}", line.session));
+        flags[i] = seen.contains(&by_value) || by_id.as_ref().is_some_and(|s| seen.contains(s));
+        seen.insert(by_value);
+        seen.extend(by_id);
+    }
+    flags
+}
+
+/// One group per session, items in log order, groups ordered by their newest item so the
+/// most recent session sits last. A line with no session (v1 logs) groups by repo instead.
+fn group_by_session(items: Vec<(&ParsedLine, Row)>) -> Vec<Row> {
+    struct Group {
+        session: String,
+        repo: String,
+        newest: String,
+        rows: Vec<Row>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (line, row) in items {
+        let id = (
+            line.session.clone(),
+            if line.session.is_empty() {
+                line.repo.clone()
+            } else {
+                String::new()
+            },
+        );
+        let slot = *index.entry(id).or_insert_with(|| {
+            groups.push(Group {
+                session: line.session.clone(),
+                repo: line.repo.clone(),
+                newest: line.ts.clone(),
+                rows: Vec::new(),
+            });
+            groups.len() - 1
         });
+        let group = &mut groups[slot];
+        if line.ts >= group.newest {
+            group.newest = line.ts.clone();
+            group.repo = line.repo.clone();
+        }
+        group.rows.push(row);
     }
+    groups.sort_by(|a, b| a.newest.cmp(&b.newest));
+    let mut out = Vec::new();
+    for group in groups {
+        out.push(Row::Blank);
+        out.push(Row::GroupHeader {
+            ts: group.newest,
+            repo: group.repo,
+            session: group.session,
+        });
+        out.extend(group.rows);
+    }
+    out
 }
 
-fn row_slot(row: &Row) -> Option<&str> {
-    match row {
-        Row::FileItem { slot, .. } | Row::CommandItem { slot, .. } => Some(slot),
-        Row::Blank | Row::GroupHeader { .. } => None,
-    }
-}
-
-/// Drops any GroupHeader (and its preceding Blank separator) left with no items under it,
-/// so removing or dismissing every item in a section does not leave an orphaned
-/// timestamp/repo line with nothing beneath it.
-pub fn prune_empty_groups(rows: &mut Vec<Row>) {
-    let mut keep = vec![true; rows.len()];
-    for i in 0..rows.len() {
-        if !matches!(rows[i], Row::GroupHeader { .. }) {
-            continue;
-        }
-        let has_items = rows[i + 1..]
-            .iter()
-            .take_while(|r| !matches!(r, Row::Blank | Row::GroupHeader { .. }))
-            .any(|r| matches!(r, Row::FileItem { .. } | Row::CommandItem { .. }));
-        if !has_items {
-            keep[i] = false;
-            if i > 0 && matches!(rows[i - 1], Row::Blank) {
-                keep[i - 1] = false;
-            }
-        }
-    }
-    let mut idx = 0;
-    rows.retain(|_| {
-        let k = keep[idx];
-        idx += 1;
-        k
-    });
-}
-
-/// Reads every line currently in the log whose timestamp is >= cutoff ("YYYY-MM-DD HH:MM:SS",
-/// which sorts correctly as a plain string). Returns the byte offset to resume tailing from.
-pub fn backfill(
-    path: &Path,
-    cutoff: &str,
-    rows: &mut Vec<Row>,
-    last_key: &mut Option<(String, String)>,
-    home: &str,
-    cleared: &HashSet<String>,
-) -> u64 {
-    let Ok(file) = File::open(path) else { return 0 };
-    let reader = BufReader::new(file);
-    let mut offset = 0u64;
-    for line in reader.lines().map_while(Result::ok) {
-        offset += line.len() as u64 + 1;
-        let Some(parsed) = parse_line(&line) else {
-            continue;
-        };
-        if parsed.ts.as_str() >= cutoff {
-            append_row(rows, last_key, &parsed, home, cleared);
-        }
-    }
-    offset
+/// Reads every line in the log, in order. Used for the first load and every poll alike.
+pub fn read_entries(path: &Path) -> Vec<ParsedLine> {
+    let mut entries = Vec::new();
+    poll_tail(path, 0, &mut entries);
+    entries
 }
 
 /// Reads whatever's been appended to the log since `offset`, returning the new offset. Only
 /// complete (newline-terminated) lines are consumed; a partial trailing line is left for the
 /// next poll rather than risking a half-written row from a concurrent hook append.
-pub fn poll_tail(
-    path: &Path,
-    offset: u64,
-    rows: &mut Vec<Row>,
-    last_key: &mut Option<(String, String)>,
-    home: &str,
-    cleared: &HashSet<String>,
-) -> u64 {
+pub fn poll_tail(path: &Path, offset: u64, entries: &mut Vec<ParsedLine>) -> u64 {
     let Ok(mut file) = File::open(path) else {
         return offset;
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
         return offset;
     };
-    // A shorter file than our last-known offset means it was truncated (`plugin.sh clear`,
-    // triggered externally or from this panel's own "clear everything" button) rather than
-    // just having nothing new yet - restart from the top instead of a stale offset that would
-    // otherwise never satisfy `len <= offset` again and silently stop noticing new content.
+    // A shorter file than our last-known offset means something outside this program
+    // replaced it. Restart from the top instead of a stale offset that would never satisfy
+    // `len <= offset` again and silently stop noticing new content.
     let offset = if len < offset {
-        rows.clear();
-        *last_key = None;
+        entries.clear();
         0
     } else {
         offset
@@ -400,7 +416,7 @@ pub fn poll_tail(
         }
         consumed += line.len() as u64;
         if let Some(parsed) = parse_line(line.trim_end_matches('\n')) {
-            append_row(rows, last_key, &parsed, home, cleared);
+            entries.push(parsed);
         }
     }
     offset + consumed
@@ -548,15 +564,7 @@ mod tests {
         // corrupt both files permanently.
         let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=command\titem=one\\ntwo";
         let parsed = parse_line(line).unwrap();
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &parsed,
-            "/home/d",
-            &HashSet::new(),
-        );
+        let rows = build(&[parsed]);
         let key = rows
             .iter()
             .find_map(|r| match r {
@@ -632,15 +640,7 @@ mod tests {
     fn file_rows_carry_a_warn_reason_when_flagged() {
         let line = "2026-09-11 18:26:26\tsession=a\trepo=r\tcwd=/c\tkind=review\twarn=missing\titem=docs/gone.md";
         let parsed = parse_line(line).unwrap();
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &parsed,
-            "/home/d",
-            &HashSet::new(),
-        );
+        let rows = build(&[parsed]);
         let warn = rows
             .iter()
             .find_map(|r| match r {
@@ -707,112 +707,149 @@ mod tests {
         }
     }
 
-    #[test]
-    fn groups_consecutive_items_sharing_timestamp_and_repo() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t1", "s1", "repo", false, None, "a.txt"),
-            "/home/d",
-            &cleared,
-        );
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t1", "s1", "repo", false, None, "b.txt"),
-            "/home/d",
-            &cleared,
-        );
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t2", "s1", "repo", false, None, "c.txt"),
-            "/home/d",
-            &cleared,
-        );
+    fn build(entries: &[ParsedLine]) -> Vec<Row> {
+        build_rows(entries, "/home/d", &HashMap::new()).visible
+    }
 
-        // Blank+Header for t1, two items, then Blank+Header for t2, one item.
-        assert_eq!(rows.len(), 7);
-        assert!(matches!(rows[0], Row::Blank));
-        assert!(matches!(rows[1], Row::GroupHeader { .. }));
-        assert!(matches!(rows[2], Row::FileItem { .. }));
-        assert!(matches!(rows[3], Row::FileItem { .. }));
-        assert!(matches!(rows[4], Row::Blank));
-        assert!(matches!(rows[5], Row::GroupHeader { .. }));
-        assert!(matches!(rows[6], Row::FileItem { .. }));
+    fn item_keys(rows: &[Row]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|r| match r {
+                Row::FileItem { key, .. } | Row::CommandItem { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn a_later_item_with_the_same_id_replaces_the_earlier_one() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
+    fn two_replies_from_one_session_share_a_group() {
+        let rows = build(&[
+            line("2026-11-05 09:00:00", "s1", "repo", false, None, "a.txt"),
+            line("2026-11-05 09:00:00", "s1", "repo", false, None, "b.txt"),
+            line("2026-11-05 09:05:00", "s1", "repo", false, None, "c.txt"),
+        ]);
+
+        // One Blank+Header, then all three items.
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], Row::Blank));
+        assert!(
+            matches!(&rows[1], Row::GroupHeader { ts, session, .. } if ts == "2026-11-05 09:05:00" && session == "s1")
+        );
+        assert!(rows[2..].iter().all(|r| matches!(r, Row::FileItem { .. })));
+    }
+
+    #[test]
+    fn two_sessions_in_one_repo_get_two_groups_newest_last() {
+        let rows = build(&[
+            line("2026-11-05 09:10:00", "s2", "repo", false, None, "late.txt"),
+            line(
+                "2026-11-05 09:00:00",
+                "s1",
+                "repo",
+                false,
+                None,
+                "early.txt",
+            ),
+            line(
+                "2026-11-05 09:20:00",
+                "s1",
+                "repo",
+                false,
+                None,
+                "newest.txt",
+            ),
+        ]);
+
+        let headers: Vec<(&str, &str)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::GroupHeader { session, ts, .. } => Some((session.as_str(), ts.as_str())),
+                _ => None,
+            })
+            .collect();
+        // s2's newest row (09:10) is older than s1's (09:20), so s1 sits last.
+        assert_eq!(
+            headers,
+            [("s2", "2026-11-05 09:10:00"), ("s1", "2026-11-05 09:20:00")]
+        );
+    }
+
+    #[test]
+    fn a_later_item_with_the_same_id_supersedes_the_earlier_one() {
         let mut first = line("t1", "s1", "repo", false, None, "/tmp/listen2");
         first.id = Some("audio".to_string());
         let mut second = line("t2", "s1", "repo", false, None, "/tmp/listen3");
         second.id = Some("audio".to_string());
-        append_row(&mut rows, &mut last_key, &first, "/home/d", &cleared);
-        append_row(&mut rows, &mut last_key, &second, "/home/d", &cleared);
+        let rows = build_rows(&[first, second], "/home/d", &HashMap::new());
 
-        let labels: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                Row::FileItem { label, .. } => Some(label.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels, ["/tmp/listen3"]);
-        // The first group's header went with it, so only one header remains.
-        let headers = rows
-            .iter()
-            .filter(|r| matches!(r, Row::GroupHeader { .. }))
-            .count();
-        assert_eq!(headers, 1);
+        assert_eq!(item_keys(&rows.visible), ["t2|s1|/tmp/listen3"]);
+        assert_eq!(item_keys(&rows.hidden), ["t1|s1|/tmp/listen2"]);
+        assert!(matches!(
+            rows.hidden[2],
+            Row::FileItem {
+                hidden: Some(Hidden::Superseded),
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn an_exact_repeat_replaces_but_other_sessions_and_items_stay() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        for l in [
-            line("t1", "s1", "repo", true, None, "echo hi"),
-            line("t1", "s2", "repo", true, None, "echo hi"),
-            line("t1", "s1", "repo", true, None, "echo other"),
-            line("t2", "s1", "repo", true, None, "echo hi"),
-        ] {
-            append_row(&mut rows, &mut last_key, &l, "/home/d", &cleared);
-        }
+    fn the_same_text_in_another_session_is_not_superseded() {
+        let rows = build_rows(
+            &[
+                line("t1", "s1", "repo", true, None, "echo hi"),
+                line("t1", "s2", "repo", true, None, "echo hi"),
+                line("t1", "s1", "repo", true, None, "echo other"),
+                line("t2", "s1", "repo", true, None, "echo hi"),
+            ],
+            "/home/d",
+            &HashMap::new(),
+        );
 
-        let keys: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                Row::CommandItem { key, .. } => Some(key.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(keys, ["t1|s2|echo hi", "t1|s1|echo other", "t2|s1|echo hi"]);
+        assert_eq!(
+            item_keys(&rows.visible),
+            ["t1|s2|echo hi", "t1|s1|echo other", "t2|s1|echo hi"]
+        );
+        assert_eq!(item_keys(&rows.hidden), ["t1|s1|echo hi"]);
+    }
+
+    #[test]
+    fn a_show_event_brings_a_superseded_row_back() {
+        let entries = [
+            line("t1", "s1", "repo", true, None, "echo hi"),
+            line("t2", "s1", "repo", true, None, "echo hi"),
+        ];
+        let cleared = HashMap::from([("t1|s1|echo hi".to_string(), false)]);
+        let rows = build_rows(&entries, "/home/d", &cleared);
+
+        assert_eq!(item_keys(&rows.visible), ["t1|s1|echo hi", "t2|s1|echo hi"]);
+        assert!(rows.hidden.is_empty());
+    }
+
+    #[test]
+    fn a_hide_event_wins_over_supersession_and_reads_as_cleared() {
+        let entries = [
+            line("t1", "s1", "repo", true, None, "echo hi"),
+            line("t2", "s1", "repo", true, None, "echo hi"),
+        ];
+        let cleared = HashMap::from([("t1|s1|echo hi".to_string(), true)]);
+        let rows = build_rows(&entries, "/home/d", &cleared);
+
+        assert!(matches!(
+            rows.hidden[2],
+            Row::CommandItem {
+                hidden: Some(Hidden::Cleared),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn different_ids_coexist() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
         let mut a = line("t1", "s1", "repo", false, None, "/a");
         a.id = Some("one".to_string());
         let mut b = line("t1", "s1", "repo", false, None, "/b");
         b.id = Some("two".to_string());
-        append_row(&mut rows, &mut last_key, &a, "/home/d", &cleared);
-        append_row(&mut rows, &mut last_key, &b, "/home/d", &cleared);
-        let items = rows
-            .iter()
-            .filter(|r| matches!(r, Row::FileItem { .. }))
-            .count();
-        assert_eq!(items, 2);
+        assert_eq!(item_keys(&build(&[a, b])).len(), 2);
     }
 
     #[test]
@@ -823,16 +860,7 @@ mod tests {
 
     #[test]
     fn command_rows_carry_their_step_label_and_a_stable_key() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t1", "s1", "repo", true, Some("2a"), "echo hi"),
-            "/home/d",
-            &cleared,
-        );
+        let rows = build(&[line("t1", "s1", "repo", true, Some("2a"), "echo hi")]);
 
         let Row::CommandItem {
             command,
@@ -854,9 +882,6 @@ mod tests {
 
     #[test]
     fn command_rows_carry_an_explicit_terminal_override() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
         let mut targeted = line(
             "t1",
             "s1",
@@ -866,7 +891,7 @@ mod tests {
             "sudo systemctl restart nginx",
         );
         targeted.terminal = Some("ssh:jump-host".to_string());
-        append_row(&mut rows, &mut last_key, &targeted, "/home/d", &cleared);
+        let rows = build(&[targeted]);
 
         let Row::CommandItem { terminal, .. } = &rows[2] else {
             panic!("expected CommandItem")
@@ -876,12 +901,9 @@ mod tests {
 
     #[test]
     fn command_rows_carry_a_warn_reason_when_flagged() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
         let mut flagged = line("t1", "s1", "repo", true, None, "redeploy the app");
         flagged.warn = Some("prose".to_string());
-        append_row(&mut rows, &mut last_key, &flagged, "/home/d", &cleared);
+        let rows = build(&[flagged]);
 
         let Row::CommandItem { warn, .. } = &rows[2] else {
             panic!("expected CommandItem")
@@ -890,68 +912,15 @@ mod tests {
     }
 
     #[test]
-    fn skips_a_cleared_item_but_still_headers_the_next_item_in_its_group() {
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let mut cleared = HashSet::new();
-        cleared.insert("t1|s1|a.txt".to_string());
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t1", "s1", "repo", false, None, "a.txt"),
+    fn a_cleared_item_leaves_no_orphaned_header() {
+        let cleared = HashMap::from([("t1|s1|a.txt".to_string(), true)]);
+        let rows = build_rows(
+            &[line("t1", "s1", "repo", false, None, "a.txt")],
             "/home/d",
             &cleared,
         );
-        // Nothing rendered for the cleared item - no orphaned header either.
-        assert!(rows.is_empty());
-        // A second, non-cleared item in the *same* group still gets a header of its own, since
-        // the cleared item deliberately left last_key untouched.
-        append_row(
-            &mut rows,
-            &mut last_key,
-            &line("t1", "s1", "repo", false, None, "b.txt"),
-            "/home/d",
-            &cleared,
-        );
-        assert_eq!(rows.len(), 3);
-        assert!(matches!(rows[0], Row::Blank));
-        assert!(matches!(rows[1], Row::GroupHeader { .. }));
-    }
-
-    #[test]
-    fn backfill_only_includes_lines_at_or_after_cutoff() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "2026-09-09 10:00:00 session=s repo=r cwd=/home/d item=old.txt"
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "2026-09-09 12:00:00 session=s repo=r cwd=/home/d item=new.txt"
-        )
-        .unwrap();
-        file.flush().unwrap();
-
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        let offset = backfill(
-            file.path(),
-            "2026-09-09 11:00:00",
-            &mut rows,
-            &mut last_key,
-            "/home/d",
-            &cleared,
-        );
-
-        assert!(offset > 0);
-        let Row::FileItem { label, .. } = rows.last().unwrap() else {
-            panic!("expected FileItem")
-        };
-        assert_eq!(label, "new.txt");
-        // Only one group (the cutoff excluded the first line entirely).
-        assert_eq!(rows.len(), 3);
+        assert!(rows.visible.is_empty());
+        assert_eq!(item_keys(&rows.hidden), ["t1|s1|a.txt"]);
     }
 
     #[test]
@@ -960,29 +929,17 @@ mod tests {
         write!(file, "2026-09-09 12:00:00 session=s repo=r cwd=/home/d item=a.txt\n2026-09-09 12:00:01 session=s repo=r cwd=/home/d item=partial").unwrap();
         file.flush().unwrap();
 
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        let offset = poll_tail(
-            file.path(),
-            0,
-            &mut rows,
-            &mut last_key,
-            "/home/d",
-            &cleared,
-        );
+        let mut entries = Vec::new();
+        let offset = poll_tail(file.path(), 0, &mut entries);
 
         // Only the complete first line was consumed - the partial trailing line is untouched.
-        assert_eq!(rows.len(), 3); // Blank, GroupHeader, FileItem
-        let Row::FileItem { label, .. } = &rows[2] else {
-            panic!("expected FileItem")
-        };
-        assert_eq!(label, "a.txt");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item, "a.txt");
         assert!(offset < file.as_file().metadata().unwrap().len());
     }
 
     #[test]
-    fn poll_tail_recovers_from_truncation() {
+    fn poll_tail_restarts_when_the_file_is_replaced_by_a_shorter_one() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
@@ -990,55 +947,16 @@ mod tests {
         )
         .unwrap();
         file.flush().unwrap();
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let cleared = HashSet::new();
-        let offset = poll_tail(
-            file.path(),
-            0,
-            &mut rows,
-            &mut last_key,
-            "/home/d",
-            &cleared,
-        );
-        assert_eq!(rows.len(), 3); // Blank, GroupHeader, FileItem
+        let mut entries = Vec::new();
+        let offset = poll_tail(file.path(), 0, &mut entries);
+        assert_eq!(entries.len(), 1);
 
-        // Simulate `plugin.sh clear`: the file shrinks out from under a stale offset.
-        file.as_file().set_len(0).unwrap();
-        file.as_file().sync_all().unwrap();
-        let offset_after_clear = poll_tail(
-            file.path(),
-            offset,
-            &mut rows,
-            &mut last_key,
-            "/home/d",
-            &cleared,
-        );
-        assert_eq!(offset_after_clear, 0);
-        assert!(
-            rows.is_empty(),
-            "truncation must wipe previously-appended rows"
-        );
-
-        // And fresh content after the clear is picked up normally from offset 0.
-        writeln!(
-            file,
-            "2026-09-09 12:05:00 session=s repo=r cwd=/home/d item=b.txt"
-        )
-        .unwrap();
-        file.flush().unwrap();
-        poll_tail(
-            file.path(),
-            offset_after_clear,
-            &mut rows,
-            &mut last_key,
-            "/home/d",
-            &cleared,
-        );
-        assert_eq!(rows.len(), 3);
-        let Row::FileItem { label, .. } = &rows[2] else {
-            panic!("expected FileItem")
-        };
-        assert_eq!(label, "b.txt");
+        // Something outside this program swaps in a shorter file under a stale offset.
+        std::fs::write(file.path(), "2026-09-09 12:05:00 session=s repo=r item=b\n").unwrap();
+        assert!(std::fs::metadata(file.path()).unwrap().len() < offset);
+        let offset_after = poll_tail(file.path(), offset, &mut entries);
+        assert!(offset_after > 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item, "b");
     }
 }

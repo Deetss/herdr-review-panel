@@ -1,12 +1,10 @@
-//! Tracks which items (file or command) have been individually or section-dismissed from the
-//! panel entirely - distinct from done.rs's "done" marks, which stay visible (struck through).
-//! One-way and append-only, same philosophy as review.log itself - `plugin.sh clear` truncates
-//! all three files together.
+//! Hide events for flagged items: `{unix_ts} hide {key}` and `{unix_ts} show {key}`, replayed
+//! by events.rs. Hiding is distinct from done.rs's marks, and restoring appends a `show`, so
+//! the file only ever grows.
 
-use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use crate::events;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 pub fn path() -> PathBuf {
     std::env::var("REVIEW_PANEL_CLEARED_LOG")
@@ -17,18 +15,43 @@ pub fn path() -> PathBuf {
         })
 }
 
-pub fn load(path: &PathBuf) -> HashSet<String> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return HashSet::new();
-    };
-    BufReader::new(file).lines().map_while(Result::ok).collect()
+/// `key -> true` when the last event is `hide`, `false` when it is `show`. Keys with no
+/// event are absent, which matters: a `show` overrides supersession, silence does not.
+pub fn load(path: &Path) -> HashMap<String, bool> {
+    events::replay(path, "hide", "show")
 }
 
-pub fn mark(path: &PathBuf, key: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+pub fn hide(path: &Path, key: &str) {
+    events::append(path, "hide", key);
+}
+
+// Restore is driven by the hidden view, which arrives in a later phase.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn show(path: &Path, key: &str) {
+    events::append(path, "show", key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn hide_then_show_leaves_the_key_visible() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        hide(file.path(), "a");
+        hide(file.path(), "b");
+        show(file.path(), "a");
+        let state = load(file.path());
+        assert!(!state["a"]);
+        assert!(state["b"]);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{key}");
+
+    #[test]
+    fn legacy_untimestamped_lines_read_as_hidden() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "2026-09-09 11:24:32|s|a.txt").unwrap();
+        file.flush().unwrap();
+        assert!(load(file.path())["2026-09-09 11:24:32|s|a.txt"]);
     }
 }

@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod cleared;
 mod done;
+mod events;
 mod log;
 mod theme;
 mod ui;
@@ -30,13 +31,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude/review.log")
         });
-    let window_minutes: i64 = std::env::var("REVIEW_PANEL_WINDOW_MINUTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
     let notify_target = std::env::var("REVIEW_PANEL_NOTIFY_TARGET").ok();
 
-    let mut app = App::new(log_path, window_minutes, notify_target);
+    let mut app = App::new(log_path, notify_target);
 
     let mut terminal = ratatui::init();
     // The pane title is how plugin.sh finds an open panel; without this the pane keeps the

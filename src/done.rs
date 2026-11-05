@@ -1,13 +1,9 @@
-//! Tracks which flagged commands have been marked complete. Marking is append-only, same
-//! philosophy as review.log itself - `plugin.sh clear` truncates both. Unmarking (the
-//! checkbox's undo, before an item sweeps into Completed - see App::unmark_done) has no
-//! append-only representation, so it rewrites the whole file from the set with that key
-//! removed instead.
+//! Done events for flagged commands: `{unix_ts} done {key}` and `{unix_ts} open {key}`, replayed
+//! by events.rs. Reopening appends an `open` event, so the file only ever grows.
 
+use crate::events;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn path() -> PathBuf {
     std::env::var("REVIEW_PANEL_DONE_LOG")
@@ -17,61 +13,52 @@ pub fn path() -> PathBuf {
         })
 }
 
-pub fn load(path: &PathBuf) -> HashSet<String> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return HashSet::new();
-    };
-    BufReader::new(file).lines().map_while(Result::ok).collect()
+/// Keys whose last event is `done`.
+pub fn load(path: &Path) -> HashSet<String> {
+    events::replay(path, "done", "open")
+        .into_iter()
+        .filter_map(|(key, done)| done.then_some(key))
+        .collect()
 }
 
-pub fn mark(path: &PathBuf, key: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{key}");
-    }
+pub fn mark(path: &Path, key: &str) {
+    events::append(path, "done", key);
 }
 
-pub fn unmark(path: &PathBuf, key: &str) {
-    let mut set = load(path);
-    if !set.remove(key) {
-        return;
-    }
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-    else {
-        return;
-    };
-    for remaining in &set {
-        let _ = writeln!(file, "{remaining}");
-    }
+pub fn open(path: &Path, key: &str) {
+    events::append(path, "open", key);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
-    fn unmark_removes_only_the_given_key() {
+    fn done_then_open_leaves_the_key_open() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        mark(&path, "a");
-        mark(&path, "b");
-        unmark(&path, "a");
-        let remaining = load(&path);
-        assert_eq!(remaining, HashSet::from(["b".to_string()]));
+        mark(file.path(), "a");
+        mark(file.path(), "b");
+        open(file.path(), "a");
+        assert_eq!(load(file.path()), HashSet::from(["b".to_string()]));
     }
 
     #[test]
-    fn unmark_of_an_absent_key_is_a_noop() {
+    fn open_never_shrinks_the_file() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        mark(&path, "a");
-        unmark(&path, "does-not-exist");
-        assert_eq!(load(&path), HashSet::from(["a".to_string()]));
+        mark(file.path(), "a");
+        let before = std::fs::read_to_string(file.path()).unwrap();
+        open(file.path(), "a");
+        let after = std::fs::read_to_string(file.path()).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(after.lines().count(), 2);
+    }
+
+    #[test]
+    fn legacy_untimestamped_lines_read_as_done() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "2026-09-09 11:24:32|s|echo hi").unwrap();
+        file.flush().unwrap();
+        assert!(load(file.path()).contains("2026-09-09 11:24:32|s|echo hi"));
     }
 }

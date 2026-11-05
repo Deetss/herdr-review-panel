@@ -1,8 +1,7 @@
 use crate::actions;
 use crate::cleared;
 use crate::done;
-use crate::log::{self, Row};
-use chrono::Local;
+use crate::log::{self, ParsedLine, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,21 +19,11 @@ const STATUS_TTL: Duration = Duration::from_millis(1500);
 /// a short command was already read.
 const DETAIL_TTL: Duration = Duration::from_millis(4000);
 
-/// How long a checked-off command stays in place before relocating to the trailing
-/// "Completed" section - long enough to register as confirmation of the check, short enough
-/// that the queue doesn't stay cluttered with done items.
-const COMPLETE_DELAY: Duration = Duration::from_secs(10);
-
 /// A repeat copy of the same command within this window is treated as a duplicate delivery
 /// of the same click, not a deliberate re-copy - long enough to absorb a burst of duplicate
 /// events, short enough that an intentional re-copy moments later (say, after a failed
 /// paste) still goes through.
 const COPY_DEBOUNCE: Duration = Duration::from_millis(500);
-
-/// Sentinel repo label for the synthetic trailing GroupHeader that collects completed
-/// commands. Paired with an empty `ts` (real log timestamps are never empty), so this can
-/// never collide with a genuine `(ts, repo)` group.
-const COMPLETED_REPO: &str = "Completed";
 
 /// Column (within the list area, 0-indexed) where a command row's "[ ]"/"[x]" checkbox ends -
 /// a 2-space indent then the 4-char box. Clicks before this column toggle done; clicks at or
@@ -46,7 +35,12 @@ pub const CHECKBOX_END_COL: u16 = 6;
 pub const WHEEL_SCROLL_LINES: isize = 3;
 
 pub struct App {
+    /// The visible rows, grouped by session. Rebuilt from `entries` whenever the log or a
+    /// mark file changes.
     pub rows: Vec<Row>,
+    /// Rows hidden by a `hide` event or by supersession, kept for the hidden view.
+    #[cfg_attr(not(test), allow(dead_code))]
+    hidden_rows: Vec<Row>,
     /// Index into `rows` of the currently highlighted item - set by keyboard navigation or
     /// mouse hover, whichever moved it most recently. Points at any row type (Backspace on a
     /// GroupHeader clears its whole section), but keyboard Up/Down only ever lands on items.
@@ -59,17 +53,12 @@ pub struct App {
     log_path: PathBuf,
     offset: u64,
     home: String,
-    last_key: Option<(String, String)>,
+    /// Every parsed log line, in log order. Rows are derived from this.
+    entries: Vec<ParsedLine>,
     done: HashSet<String>,
     done_path: PathBuf,
-    /// When each done key was checked, so sweep_completed knows when COMPLETE_DELAY has
-    /// elapsed. In-memory only - a restart re-seeds it from done.rs (see with_paths), which
-    /// is fine since a key already done before this run has no real "when" to honor anyway.
-    done_since: HashMap<String, Instant>,
-    /// Keys already relocated into the Completed section, so sweep_completed only ever
-    /// considers newly-eligible ones instead of rescanning everything every tick.
-    completed: HashSet<String>,
-    cleared: HashSet<String>,
+    /// Replayed cleared log: `true` for a key last hidden, `false` for one last restored.
+    cleared: HashMap<String, bool>,
     cleared_path: PathBuf,
     status: Option<(String, Instant)>,
     /// The command currently shown full-screen, if any, alongside when it was shown. The
@@ -102,15 +91,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(log_path: PathBuf, window_minutes: i64, notify_target: Option<String>) -> Self {
+    pub fn new(log_path: PathBuf, notify_target: Option<String>) -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
-        let mut app = Self::with_paths(
-            log_path,
-            window_minutes,
-            home,
-            done::path(),
-            cleared::path(),
-        );
+        let mut app = Self::with_paths(log_path, home, done::path(), cleared::path());
         app.notify_target = notify_target;
         app
     }
@@ -120,35 +103,17 @@ impl App {
     /// real user state or each other over shared env vars.
     pub fn with_paths(
         log_path: PathBuf,
-        window_minutes: i64,
         home: String,
         done_path: PathBuf,
         cleared_path: PathBuf,
     ) -> Self {
-        let cutoff = (Local::now() - Duration::from_secs((window_minutes.max(0) as u64) * 60))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
         let done = done::load(&done_path);
-        // Already done before this run started - there's no real "when" for these (done.rs
-        // carries no timestamp), so treat them as already past COMPLETE_DELAY rather than
-        // making the user wait again on every reopen.
-        let done_since = done
-            .iter()
-            .map(|k| (k.clone(), Instant::now() - COMPLETE_DELAY))
-            .collect();
         let cleared = cleared::load(&cleared_path);
-        let mut rows = Vec::new();
-        let mut last_key = None;
-        let offset = log::backfill(
-            &log_path,
-            &cutoff,
-            &mut rows,
-            &mut last_key,
-            &home,
-            &cleared,
-        );
+        let mut entries = Vec::new();
+        let offset = log::poll_tail(&log_path, 0, &mut entries);
         let mut app = App {
-            rows,
+            rows: Vec::new(),
+            hidden_rows: Vec::new(),
             cursor: None,
             scroll: 0,
             close_hovered: false,
@@ -159,11 +124,9 @@ impl App {
             log_path,
             offset,
             home,
-            last_key,
+            entries,
             done,
             done_path,
-            done_since,
-            completed: HashSet::new(),
             cleared,
             cleared_path,
             status: None,
@@ -173,59 +136,43 @@ impl App {
             pending_report: false,
             last_copy: None,
         };
-        app.sweep_completed();
+        app.rebuild();
         app.jump_to_latest();
         app
     }
 
+    /// Re-derives the visible and hidden rows from the entries and the replayed mark files.
+    fn rebuild(&mut self) {
+        let rows = log::build_rows(&self.entries, &self.home, &self.cleared);
+        self.rows = rows.visible;
+        self.hidden_rows = rows.hidden;
+        self.cursor = self.cursor.filter(|&c| c < self.rows.len());
+        self.ensure_cursor_visible();
+    }
+
     /// Polls the log for newly-appended lines and reloads the done/cleared marks files, so
-    /// changes made from another instance of this panel show up here too. Returns true if the
-    /// log changed (so the caller knows to redraw immediately rather than waiting for the next
-    /// tick).
+    /// changes made from another instance of this panel show up here too. Returns true if
+    /// anything changed (so the caller knows to redraw immediately rather than waiting for
+    /// the next tick).
     pub fn poll(&mut self) -> bool {
         let before = self.rows.len();
         let offset_before = self.offset;
-        self.offset = log::poll_tail(
-            &self.log_path,
-            self.offset,
-            &mut self.rows,
-            &mut self.last_key,
-            &self.home,
-            &self.cleared,
-        );
-        self.done = done::load(&self.done_path);
-        // A key can arrive here already done without ever going through this instance's
-        // mark_done - another panel instance completed it. Same reasoning as with_paths' initial seed: there's no real "when" to honor
-        // from this instance's perspective, so treat it as already elapsed rather than never
-        // sweeping it at all (done_since would otherwise simply have no entry for it, ever).
-        for key in &self.done {
-            self.done_since
-                .entry(key.clone())
-                .or_insert_with(|| Instant::now() - COMPLETE_DELAY);
-        }
+        self.offset = log::poll_tail(&self.log_path, self.offset, &mut self.entries);
+        let log_changed = self.offset != offset_before;
+        let new_done = done::load(&self.done_path);
         let new_cleared = cleared::load(&self.cleared_path);
-        if new_cleared != self.cleared {
-            // Someone (another instance, or this panel's own clear-all) dismissed something
-            // already sitting in `rows` - drop it retroactively rather than waiting for a
-            // restart's backfill to skip it.
-            self.cleared = new_cleared;
-            self.rows
-                .retain(|r| row_key(r).is_none_or(|k| !self.cleared.contains(k)));
-            self.prune_empty_groups();
+        let marks_changed = new_done != self.done || new_cleared != self.cleared;
+        if !log_changed && !marks_changed {
+            return false;
         }
-        // A replacement can leave the row count unchanged, so new log bytes count as change too.
-        let structural_change = self.rows.len() != before || self.offset != offset_before;
-        if structural_change {
+        self.done = new_done;
+        self.cleared = new_cleared;
+        self.rebuild();
+        // A supersession can leave the row count unchanged, so new log bytes count too.
+        if log_changed || self.rows.len() != before {
             self.jump_to_latest();
         }
-        // Independent of the length check above: a sweep relocates rows without changing
-        // how many there are, so it needs its own trigger for the caller to know to redraw
-        // and its own jump_to_latest (idempotent if both fire in the same tick).
-        if self.sweep_completed() {
-            self.jump_to_latest();
-            return true;
-        }
-        structural_change
+        true
     }
 
     pub fn is_done(&self, key: &str) -> bool {
@@ -271,30 +218,28 @@ impl App {
         self.detail_title
     }
 
-    /// Marks an item done for display purposes (struck through, eventually relocated to
-    /// Completed) - shared by copying and by the checkbox. Does *not* report anything back
-    /// to the agent; see confirm_done for that. Returns whether this call is what actually
-    /// marked it (false for an already-done key), so confirm_done only ever reports once.
+    /// Marks an item done for display purposes (struck through) - shared by copying and by
+    /// the checkbox. Does *not* report anything back to the agent; see confirm_done for
+    /// that. Returns whether this call is what actually marked it (false for an already-done
+    /// key), so confirm_done only ever reports once.
     fn mark_done(&mut self, key: &str) -> bool {
         if self.done.insert(key.to_string()) {
             done::mark(&self.done_path, key);
-            self.done_since.insert(key.to_string(), Instant::now());
             true
         } else {
             false
         }
     }
 
-    /// The checkbox's undo - reverses mark_done for an item that hasn't swept into Completed
-    /// yet (see toggle_done, the only caller). Also drops the item's group from `notified`,
-    /// so if it's re-confirmed later and the group becomes fully done again, the agent still
-    /// gets notified instead of that being silently swallowed by the earlier notification.
+    /// The checkbox's undo - appends an `open` event for a done item (see toggle_done, the
+    /// only caller). Also drops the item's group from `notified`, so if it's re-confirmed
+    /// later and the group becomes fully done again, the agent still gets notified instead
+    /// of that being silently swallowed by the earlier notification.
     fn unmark_done(&mut self, key: &str) {
         if !self.done.remove(key) {
             return;
         }
-        done::unmark(&self.done_path, key);
-        self.done_since.remove(key);
+        done::open(&self.done_path, key);
         let group_key = key.splitn(3, '|').take(2).collect::<Vec<_>>().join("|");
         self.notified.remove(&group_key);
         self.set_status("Unchecked");
@@ -334,14 +279,10 @@ impl App {
     }
 
     /// The checkbox's full behavior: marks a not-yet-done command done (confirm_done), or
-    /// undoes an already-done one (unmark_done) - as long as it hasn't relocated into the
-    /// Completed section yet, at which point the checkbox goes back to being one-way, since
-    /// CommandItem carries no `repo` to safely reconstruct where it came from.
+    /// reopens an already-done one (unmark_done).
     fn toggle_done(&mut self, key: &str) {
         if self.done.contains(key) {
-            if !self.completed.contains(key) {
-                self.unmark_done(key);
-            }
+            self.unmark_done(key);
             return;
         }
         self.confirm_done(key);
@@ -383,7 +324,7 @@ impl App {
         let all_done = self.rows.iter().all(|row| match row {
             Row::CommandItem { key, .. } => {
                 has_command = true;
-                self.done.contains(key) || self.completed.contains(key)
+                self.done.contains(key)
             }
             _ => true,
         });
@@ -414,8 +355,9 @@ impl App {
         let Some(target) = self.notify_target.clone() else {
             return;
         };
-        // "{ts}|{session}" - the key's first two segments (see log.rs's item_key) - already
-        // uniquely identifies the group these rows came from without needing a stored id.
+        // "{ts}|{session}" - the key's first two segments (see ParsedLine::key) - identifies
+        // the hook invocation that flagged this row. A session group can span several, and
+        // each is notified on its own once its commands are all done.
         let group_key = key.splitn(3, '|').take(2).collect::<Vec<_>>().join("|");
         if self.notified.contains(&group_key) {
             return;
@@ -426,11 +368,12 @@ impl App {
         let Some((start, end)) = self.group_range(idx) else {
             return;
         };
+        let prefix = format!("{group_key}|");
         let mut has_command = false;
         let all_done = self.rows[start..end].iter().all(|row| match row {
-            Row::CommandItem { key: cmd_key, .. } => {
+            Row::CommandItem { key: cmd_key, .. } if cmd_key.starts_with(&prefix) => {
                 has_command = true;
-                self.done.contains(cmd_key) || self.completed.contains(cmd_key)
+                self.done.contains(cmd_key)
             }
             _ => true,
         });
@@ -448,59 +391,13 @@ impl App {
         );
     }
 
-    /// Marks an item dismissed and drops it from `rows` immediately - unlike `mark_done`,
-    /// which keeps the row visible (struck through), this removes it from view entirely.
+    /// Appends a `hide` event for an item. The caller rebuilds `rows` once it has hidden
+    /// everything it means to.
     fn mark_cleared(&mut self, key: &str) {
-        if self.cleared.insert(key.to_string()) {
-            cleared::mark(&self.cleared_path, key);
+        if self.cleared.get(key) != Some(&true) {
+            cleared::hide(&self.cleared_path, key);
+            self.cleared.insert(key.to_string(), true);
         }
-        self.rows.retain(|r| row_key(r) != Some(key));
-        // Otherwise a cleared-then-forgotten key would sit in these maps forever - harmless
-        // but pointless to keep once the row it describes is gone for good.
-        self.done_since.remove(key);
-        self.completed.remove(key);
-    }
-
-    fn prune_empty_groups(&mut self) {
-        log::prune_empty_groups(&mut self.rows);
-    }
-
-    /// Relocates any command checked off at least COMPLETE_DELAY ago out of its normal
-    /// position into a single trailing "Completed" section. Cheap no-op on an ordinary tick
-    /// (the common case) since it bails before touching `rows` at all when nothing is newly
-    /// eligible. Returns whether anything moved, so the caller knows to redraw/rejump.
-    fn sweep_completed(&mut self) -> bool {
-        let newly_eligible: HashSet<String> = self
-            .done_since
-            .iter()
-            .filter(|(k, at)| !self.completed.contains(*k) && at.elapsed() >= COMPLETE_DELAY)
-            .map(|(k, _)| k.clone())
-            .collect();
-        if newly_eligible.is_empty() {
-            return false;
-        }
-        // Stable partition: both halves keep their original relative order for free, so
-        // rows already sitting in a prior Completed section (kept, since their key is in
-        // `completed` rather than `newly_eligible`) stay exactly where they are.
-        let (kept, moved): (Vec<Row>, Vec<Row>) =
-            std::mem::take(&mut self.rows).into_iter().partition(
-                |r| !matches!(r, Row::CommandItem { key, .. } if newly_eligible.contains(key)),
-            );
-        self.rows = kept;
-        self.prune_empty_groups();
-        let has_completed_header = self.rows.iter().any(
-            |r| matches!(r, Row::GroupHeader { ts, repo } if ts.is_empty() && repo == COMPLETED_REPO),
-        );
-        if !has_completed_header {
-            self.rows.push(Row::Blank);
-            self.rows.push(Row::GroupHeader {
-                ts: String::new(),
-                repo: COMPLETED_REPO.to_string(),
-            });
-        }
-        self.rows.extend(moved);
-        self.completed.extend(newly_eligible);
-        true
     }
 
     fn activatable_rows(&self) -> impl Iterator<Item = usize> + '_ {
@@ -601,7 +498,7 @@ impl App {
             }
             _ => return,
         }
-        self.prune_empty_groups();
+        self.rebuild();
         self.jump_to_latest();
     }
 
@@ -628,18 +525,18 @@ impl App {
         }
     }
 
-    /// The top "clear" button: wipes review.log, done-marks, and cleared-marks entirely via
-    /// the same plugin.sh path the tools-menu action uses, then closes the panel the same
-    /// way click_close does. Does not notify the agent.
+    /// The top "clear" button: appends a `hide` event for every visible row (the logs
+    /// themselves are never cut), then closes the panel the same way click_close does. Does
+    /// not notify the agent.
     pub fn click_clear_all(&mut self) {
         self.clear_and_close(None);
     }
 
-    /// Shared by click_clear_all and all_commands_done's auto-trigger: wipes the queue,
+    /// Shared by click_clear_all and all_commands_done's auto-trigger: hides the queue,
     /// optionally notifies the flagging agent (Some(message) only; the clear button sends
     /// none), then closes the panel the same way click_close does.
     fn clear_and_close(&mut self, notify_message: Option<&str>) {
-        actions::clear_all();
+        actions::clear_all(&self.log_path, &self.cleared_path);
         if let (Some(message), Some(target)) = (notify_message, self.notify_target.as_ref()) {
             actions::notify_agent(target, message);
         }
@@ -738,6 +635,7 @@ fn plan_activation(row: &Row) -> Option<Activation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Local;
     use std::io::Write as _;
 
     /// Keeps the tempfiles alive for the fixture's lifetime - App only stores their paths,
@@ -757,7 +655,6 @@ mod tests {
         let cleared = tempfile::NamedTempFile::new().unwrap();
         let app = App::with_paths(
             log.path().to_path_buf(),
-            10,
             "/home/d".to_string(),
             done.path().to_path_buf(),
             cleared.path().to_path_buf(),
@@ -870,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_done_cursor_marks_then_unmarks_before_sweep() {
+    fn toggle_done_cursor_marks_then_reopens_with_an_open_event() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         f.app.toggle_done_cursor();
         let key = {
@@ -882,8 +779,13 @@ mod tests {
         assert!(f.app.is_done(&key));
         f.app.toggle_done_cursor();
         assert!(!f.app.is_done(&key));
-        assert!(!f.app.done_since.contains_key(&key));
         assert!(!done::load(&f.app.done_path).contains(&key));
+        let written = std::fs::read_to_string(&f.app.done_path).unwrap();
+        assert_eq!(
+            written.lines().count(),
+            2,
+            "done then open, nothing rewritten"
+        );
     }
 
     #[test]
@@ -900,26 +802,6 @@ mod tests {
         assert!(f.app.is_done(&key), "copy should have marked it done");
         f.app.click_row(idx, 0, 80); // inside the checkbox column
         assert!(!f.app.is_done(&key), "checkbox should undo the copy's mark");
-    }
-
-    #[test]
-    fn toggle_is_a_noop_once_swept_to_completed() {
-        let mut f = fixture(&now_command_line("r", "echo hi"));
-        f.app.toggle_done_cursor();
-        let key = {
-            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
-        f.app
-            .done_since
-            .insert(key.clone(), Instant::now() - Duration::from_secs(11));
-        f.app.sweep_completed();
-        assert!(f.app.completed.contains(&key));
-        f.app.toggle_done_cursor();
-        assert!(f.app.is_done(&key), "already-swept items stay one-way");
-        assert!(f.app.completed.contains(&key));
     }
 
     #[test]
@@ -985,128 +867,60 @@ mod tests {
     }
 
     #[test]
-    fn toggling_done_does_not_immediately_relocate_the_row() {
+    fn a_done_row_stays_in_its_session_group_after_a_poll() {
         let mut f = fixture(&now_command_line("r", "echo hi"));
         f.app.toggle_done_cursor();
         f.app.poll();
-        // COMPLETE_DELAY hasn't elapsed yet - still Blank, GroupHeader, the one command, no
-        // Completed section.
+        // Blank, GroupHeader, the one command. No time-based move, no synthetic section.
         assert_eq!(f.app.rows.len(), 3);
-        assert!(
-            !f.app
+        assert_eq!(
+            f.app
                 .rows
                 .iter()
-                .any(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed")),
-            "no Completed section should exist before the delay elapses"
+                .filter(|r| matches!(r, Row::GroupHeader { .. }))
+                .count(),
+            1
         );
     }
 
     #[test]
-    fn a_command_moves_to_completed_once_the_delay_elapses() {
-        let mut f = fixture(&now_command_line("r", "echo hi"));
-        f.app.toggle_done_cursor();
-        let key = {
-            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
-        // No real sleep: back-date the in-memory timer past COMPLETE_DELAY directly.
-        f.app
-            .done_since
-            .insert(key.clone(), Instant::now() - Duration::from_secs(11));
-
-        assert!(f.app.sweep_completed(), "sweep should report a relocation");
-
-        let header_idx = f
-            .app
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
-            .expect("expected a Completed header");
-        let moved_idx = f
-            .app
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::CommandItem { key: k, .. } if k == &key))
-            .expect("expected the command row to still exist");
-        assert!(
-            moved_idx > header_idx,
-            "the completed command should sit after the Completed header"
-        );
-        // A second sweep with nothing newly eligible is a no-op, not a duplicate move.
-        assert!(!f.app.sweep_completed());
-    }
-
-    #[test]
-    fn items_already_done_at_load_time_land_in_completed_immediately() {
+    fn rows_done_before_launch_load_as_done_in_place() {
         let mut log = tempfile::NamedTempFile::new().unwrap();
         write!(log, "{}", now_command_line("r", "echo hi")).unwrap();
         log.flush().unwrap();
         let done = tempfile::NamedTempFile::new().unwrap();
         let cleared = tempfile::NamedTempFile::new().unwrap();
-
-        // Mark it done on disk *before* the panel ever loads it - there's no session to have
-        // watched it get checked, so it should skip the waiting period entirely.
-        let key = {
-            let probe = App::with_paths(
+        let open = |done: &tempfile::NamedTempFile| {
+            App::with_paths(
                 log.path().to_path_buf(),
-                10,
                 "/home/d".to_string(),
                 done.path().to_path_buf(),
                 cleared.path().to_path_buf(),
-            );
+            )
+        };
+
+        let key = {
+            let probe = open(&done);
             let Row::CommandItem { key, .. } = &probe.rows[probe.cursor.unwrap()] else {
                 panic!("expected CommandItem")
             };
             key.clone()
         };
-        done::mark(&done.path().to_path_buf(), &key);
+        done::mark(done.path(), &key);
 
-        let app = App::with_paths(
-            log.path().to_path_buf(),
-            10,
-            "/home/d".to_string(),
-            done.path().to_path_buf(),
-            cleared.path().to_path_buf(),
-        );
-        let header_idx = app
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
-            .expect("expected a Completed header on load");
-        let moved_idx = app
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::CommandItem { key: k, .. } if k == &key))
-            .expect("expected the command row to exist");
-        assert!(moved_idx > header_idx);
+        let app = open(&done);
+        assert!(app.is_done(&key));
+        assert_eq!(app.rows.len(), 3);
     }
 
     #[test]
-    fn clearing_the_completed_header_clears_every_item_under_it() {
-        let mut f = fixture(&now_command_line("r", "echo hi"));
-        f.app.toggle_done_cursor();
-        let key = {
-            let Row::CommandItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
-                panic!("expected CommandItem")
-            };
-            key.clone()
-        };
-        f.app
-            .done_since
-            .insert(key, Instant::now() - Duration::from_secs(11));
-        f.app.sweep_completed();
-
-        let header_idx = f
-            .app
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::GroupHeader { repo, .. } if repo == "Completed"))
-            .unwrap();
-        f.app.cursor = Some(header_idx);
+    fn clearing_a_session_header_hides_every_row_of_that_session() {
+        let mut f = fixture(&two_command_group("r", "echo a", "echo b"));
+        f.app.cursor = Some(1);
         f.app.clear_cursor();
         assert!(f.app.rows.is_empty());
+        let hides = std::fs::read_to_string(&f.app.cleared_path).unwrap();
+        assert_eq!(hides.lines().filter(|l| l.contains(" hide ")).count(), 2);
     }
 
     #[test]
@@ -1145,7 +959,6 @@ mod tests {
 
         let reopened = App::with_paths(
             f._log.path().to_path_buf(),
-            10,
             "/home/d".to_string(),
             f._done.path().to_path_buf(),
             f._cleared.path().to_path_buf(),
@@ -1196,13 +1009,31 @@ mod tests {
     }
 
     #[test]
-    fn poll_recovers_when_the_log_is_truncated() {
+    fn poll_recovers_when_the_log_is_replaced_externally() {
         let mut f = fixture(&now_line("r", "a.txt"));
         assert!(!f.app.rows.is_empty());
-        f._log.as_file().set_len(0).unwrap();
-        f._log.as_file().sync_all().unwrap();
+        std::fs::write(f._log.path(), "").unwrap();
         f.app.poll();
         assert!(f.app.rows.is_empty());
+    }
+
+    #[test]
+    fn a_hide_then_show_event_round_trips_through_poll() {
+        let mut f = fixture(&now_line("r", "a.txt"));
+        let key = {
+            let Row::FileItem { key, .. } = &f.app.rows[f.app.cursor.unwrap()] else {
+                panic!("expected FileItem")
+            };
+            key.clone()
+        };
+        cleared::hide(&f.app.cleared_path, &key);
+        f.app.poll();
+        assert!(f.app.rows.is_empty());
+        assert_eq!(f.app.hidden_rows.len(), 3);
+        cleared::show(&f.app.cleared_path, &key);
+        f.app.poll();
+        assert_eq!(f.app.rows.len(), 3);
+        assert!(f.app.hidden_rows.is_empty());
     }
 
     #[test]
@@ -1214,7 +1045,7 @@ mod tests {
             };
             key.clone()
         };
-        cleared::mark(&f.app.cleared_path, &key);
+        cleared::hide(&f.app.cleared_path, &key);
         f.app.poll();
         assert!(f.app.rows.is_empty());
     }
