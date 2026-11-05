@@ -32,16 +32,20 @@ pub fn close() {
 }
 
 /// Appends one `hide` event per row currently visible. review.log and the done log are only
-/// read, so nothing is lost and the hidden rows can be restored later.
-pub fn clear_all(log_path: &Path, cleared_path: &Path) {
+/// read, so nothing is lost and the hidden rows can be restored later. Returns how many rows
+/// it hid.
+pub fn clear_all(log_path: &Path, cleared_path: &Path) -> usize {
     let entries = log::read_entries(log_path);
     let home = std::env::var("HOME").unwrap_or_default();
     let state = cleared::load(cleared_path);
+    let mut hidden = 0;
     for row in log::build_rows(&entries, &home, &state).visible {
         if let Row::FileItem { key, .. } | Row::CommandItem { key, .. } = row {
             cleared::hide(cleared_path, &key);
+            hidden += 1;
         }
     }
+    hidden
 }
 
 /// Tells the agent that flagged these items to continue, via `orca terminal send` - see

@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::log::Row;
+use crate::log::{Hidden, Row};
 use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -8,14 +8,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 const CLEAR_ALL_LABEL: &str = "clear";
+const RESTORE_LABEL: &str = "restore";
 /// Rows reserved at the bottom for key hints.
 const FOOTER_ROWS: u16 = 2;
 /// Top inset, header and divider above the body.
 const CHROME_ROWS: u16 = 3;
 
-/// Rows the body gets in a terminal `total_height` rows tall.
-pub fn body_height(total_height: u16) -> usize {
-    total_height.saturating_sub(CHROME_ROWS + FOOTER_ROWS) as usize
+/// Rows the body gets in a terminal `total_width` by `total_height` cells.
+pub fn body_height(app: &App, total_width: u16, total_height: u16) -> usize {
+    let spacer = u16::from(footer_needs_spacer(app, total_width.saturating_sub(1)));
+    total_height.saturating_sub(CHROME_ROWS + FOOTER_ROWS + spacer) as usize
+}
+
+/// The hidden view's footer can fill both footer rows, which would leave its last HIDDEN row
+/// touching the first footer row. One body row is given up to keep a blank between them.
+fn footer_needs_spacer(app: &App, drawable_width: u16) -> bool {
+    app.hidden_view() && !footer_rows(&footer_segments(app), drawable_width as usize)[1].is_empty()
 }
 
 /// The header counts, shortened to fit `room` columns: the "Queue: " prefix goes first, then
@@ -39,7 +47,9 @@ fn done_hint(app: &App) -> Option<&'static str> {
             expanded: false, ..
         } => Some("Enter: open"),
         Row::Summary { .. } => Some("Enter: fold"),
-        Row::CommandItem { key, .. } if app.is_done(key) => Some("Enter: fold"),
+        Row::CommandItem {
+            key, hidden: None, ..
+        } if app.is_done(key) => Some("Enter: fold"),
         _ => None,
     }
 }
@@ -47,6 +57,9 @@ fn done_hint(app: &App) -> Option<&'static str> {
 /// Key hints for whatever the cursor is on, in priority order.
 fn footer_segments(app: &App) -> Vec<&'static str> {
     const TAIL: [&str; 4] = ["Bksp clear", "c clear done", "H hidden", "S clear session"];
+    if app.hidden_view() {
+        return vec!["r restore", "R restore all", "H back"];
+    }
     if app.rows.is_empty() {
         return vec!["H hidden", "q close"];
     }
@@ -124,6 +137,14 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         Constraint::Length(FOOTER_ROWS),
     ])
     .areas(area);
+    let list_area = if footer_needs_spacer(app, area.width) {
+        Rect {
+            height: list_area.height.saturating_sub(1),
+            ..list_area
+        }
+    } else {
+        list_area
+    };
 
     let close_style = if app.close_hovered {
         theme::close_button_highlighted()
@@ -143,7 +164,13 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     } else {
         theme::clear_all_button()
     };
-    let clear_all_width = CLEAR_ALL_LABEL.len() as u16;
+    // In the hidden view the same slot holds `restore`, which restores every hidden row.
+    let (button_label, has_rows) = if app.hidden_view() {
+        (RESTORE_LABEL, app.hidden_count > 0)
+    } else {
+        (CLEAR_ALL_LABEL, app.open_count + app.done_count > 0)
+    };
+    let clear_all_width = button_label.len() as u16;
     let clear_slot = Rect {
         x: close_button.x.saturating_sub(2 + clear_all_width),
         y: close_area.y,
@@ -152,14 +179,13 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     };
     // The slot stays reserved when the button is absent, so the counts read the same in the
     // empty state as in every other one.
-    let has_rows = app.open_count + app.done_count > 0;
     let clear_all_button = Rect {
         width: if has_rows { clear_all_width } else { 0 },
         ..clear_slot
     };
     if has_rows {
         frame.render_widget(
-            Paragraph::new(Span::styled(CLEAR_ALL_LABEL, clear_all_style)),
+            Paragraph::new(Span::styled(button_label, clear_all_style)),
             clear_all_button,
         );
     }
@@ -425,6 +451,41 @@ fn content_budget(width: u16) -> usize {
     (width as usize).saturating_sub(2)
 }
 
+/// A HIDDEN row: checkbox as it was, the text, and the reason right aligned to the last
+/// column. The reason is never cut; the text gives way to it and keeps one gap column.
+fn render_hidden_item(
+    text: &str,
+    trim: Trim,
+    checked: bool,
+    reason: Hidden,
+    highlighted: bool,
+    width: u16,
+) -> Line<'static> {
+    let tag = match reason {
+        Hidden::Cleared => "cleared",
+        Hidden::Superseded => "superseded",
+    };
+    let (box_style, text_style) = if highlighted {
+        (
+            theme::checkbox_highlighted(),
+            theme::hidden_command_highlighted(),
+        )
+    } else {
+        (theme::checkbox(), theme::hidden_command())
+    };
+    let last = (width as usize).saturating_sub(1);
+    let room = last.saturating_sub(tag.len() + 6);
+    let text = fit(text, room, trim);
+    let used = 6 + text.chars().count() + tag.len();
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(if checked { "[x] " } else { "[ ] " }, box_style),
+        Span::styled(text, text_style),
+        Span::raw(" ".repeat((width as usize).saturating_sub(used))),
+        Span::styled(tag, theme::dim()),
+    ])
+}
+
 fn render_row(
     row: &Row,
     highlighted: bool,
@@ -489,6 +550,47 @@ fn render_row(
             ];
             Line::from(with_clear_glyph(spans, width, Trim::Tail))
         }
+        Row::HiddenHeader { ts, repo, .. } => {
+            let clock = clock(ts);
+            let repo_room = (width as usize)
+                .saturating_sub(1 + clock.chars().count())
+                .max(3);
+            Line::from(vec![
+                Span::styled(fit(repo, repo_room, Trim::Tail), theme::hidden_header()),
+                Span::raw(" "),
+                Span::styled(clock, theme::dim()),
+            ])
+        }
+        Row::FileItem {
+            label,
+            abspath,
+            key,
+            hidden: Some(reason),
+            ..
+        } => {
+            let text = abspath.clone().unwrap_or_else(|| label.clone());
+            render_hidden_item(
+                &text,
+                Trim::Head,
+                app.is_done(key),
+                *reason,
+                highlighted,
+                width,
+            )
+        }
+        Row::CommandItem {
+            command,
+            key,
+            hidden: Some(reason),
+            ..
+        } => render_hidden_item(
+            &command.replace('\n', " \u{23ce} "),
+            Trim::Tail,
+            app.is_done(key),
+            *reason,
+            highlighted,
+            width,
+        ),
         Row::FileItem {
             label,
             abspath,
@@ -678,6 +780,11 @@ mod tests {
         }
 
         fn app_from(log: &str, done: &[&str]) -> (App, Files) {
+            app_with_hides(log, done, &[])
+        }
+
+        /// Like `app_from`, with a `hide` event already logged for each of `hidden`.
+        fn app_with_hides(log: &str, done: &[&str], hidden: &[&str]) -> (App, Files) {
             let mut log_file = tempfile::NamedTempFile::new().unwrap();
             write!(log_file, "{log}").unwrap();
             log_file.flush().unwrap();
@@ -686,6 +793,9 @@ mod tests {
                 crate::done::mark(done_file.path(), key);
             }
             let cleared = tempfile::NamedTempFile::new().unwrap();
+            for key in hidden {
+                crate::cleared::hide(cleared.path(), key);
+            }
             let app = App::with_paths(
                 log_file.path().to_path_buf(),
                 "/home/d".to_string(),
@@ -706,8 +816,44 @@ mod tests {
             app_from(LOG, &DONE)
         }
 
+        /// Three hidden rows: `systemctl status orca` is superseded by the row that shares
+        /// its `id`, `journalctl -u orca` is cleared, and `cargo build` is both superseded by
+        /// the later done row and cleared, so it reads `cleared`.
+        fn hidden_sample() -> (App, Files) {
+            let log = format!(
+                "2026-11-04 17:28:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\tid=svc\titem=systemctl status orca\n\
+                 2026-11-04 17:28:00\tsession=sa\trepo=hub\tcwd=/home/d\tkind=command\titem=journalctl -u orca\n\
+                 2026-11-05 09:07:00\tsession=sc\trepo=cqc\tcwd=/home/d\tkind=command\titem=cargo build\n\
+                 {}",
+                LOG.replace(
+                    "step=1\titem=systemctl restart orca",
+                    "step=1\tid=svc\titem=systemctl restart orca"
+                )
+            );
+            app_with_hides(
+                &log,
+                &DONE,
+                &[
+                    "2026-11-04 17:28:00|sa|journalctl -u orca",
+                    "2026-11-05 09:07:00|sc|cargo build",
+                ],
+            )
+        }
+
+        /// `content` with `tag` ending on the drawable width's last column.
+        fn with_tag(content: &str, tag: &str, drawable: usize) -> String {
+            let pad = drawable - content.chars().count() - tag.len();
+            format!("{content}{}{tag}", " ".repeat(pad))
+        }
+
+        fn row_index(rows: &[String], text: &str) -> usize {
+            rows.iter()
+                .position(|r| r.trim_end() == text)
+                .unwrap_or_else(|| panic!("no row reads {text:?}"))
+        }
+
         fn draw_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
-            app.set_visible_height(body_height(height));
+            app.set_visible_height(body_height(app, width, height));
             let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| _ = draw(f, app)).unwrap();
             terminal.backend().buffer().clone()
@@ -995,6 +1141,145 @@ mod tests {
                 format!("{:<30}x", "0 open \u{b7} 0 done")
             );
             assert_eq!(rows[3].trim_end(), "Nothing to review.");
+        }
+
+        #[test]
+        fn default_view_never_draws_hidden_rows() {
+            let (mut app, _files) = hidden_sample();
+            let buf = draw_buffer(&mut app, 40, 24);
+            let rows = rows_of(&buf);
+            assert!(rows[1].starts_with("Queue: 4 open \u{b7} 4 done"));
+            assert_eq!(cols(&rows[1], 31, 36), "clear");
+            for text in [
+                "HIDDEN",
+                "superseded",
+                "cleared",
+                "journalctl",
+                "status orca",
+            ] {
+                assert!(rows.iter().all(|r| !r.contains(text)), "{text} leaked");
+            }
+        }
+
+        #[test]
+        fn hidden_view_at_40_columns() {
+            let (mut app, _files) = hidden_sample();
+            app.toggle_hidden_view();
+            let buf = draw_buffer(&mut app, 40, 24);
+            capture("hidden-40", &buf);
+            let rows = rows_of(&buf);
+            let w = 39;
+            assert!(rows[1].starts_with("Queue: 4 open \u{b7} 4 done"));
+            assert_eq!(cols(&rows[1], 29, 36), "restore");
+            assert!(!rows[1].contains("clear"));
+            assert_eq!(rows[1].chars().nth(38), Some('x'));
+
+            // OPEN and DONE keep their rows and their x.
+            assert_eq!(rows[3].trim_end(), "OPEN");
+            assert_eq!(rows[10].trim_end(), with_x("  [ ] cargo test", w));
+            assert_eq!(rows[13].trim_end(), with_x("hub  [x] 3 rows, 17:20", w));
+
+            let label = row_index(&rows, "HIDDEN (3)");
+            assert_eq!(label, 16);
+            assert_eq!(rows[label - 1].trim_end(), "", "blank row above the label");
+            assert_eq!(rows[label + 1].trim_end(), "hub 17:28");
+            assert_eq!(
+                rows[label + 2].trim_end(),
+                with_tag("  [ ] systemctl status orca", "superseded", w)
+            );
+            assert_eq!(
+                rows[label + 3].trim_end(),
+                with_tag("  [ ] journalctl -u orca", "cleared", w)
+            );
+            assert_eq!(rows[label + 4].trim_end(), "cqc 09:07");
+            assert_eq!(
+                rows[label + 5].trim_end(),
+                with_tag("  [ ] cargo build", "cleared", w)
+            );
+            // The one-row footer leaves the row above it blank.
+            assert_eq!(rows[22].trim_end(), "");
+            assert_eq!(
+                rows[23].trim_end(),
+                "r restore \u{b7} R restore all \u{b7} H back"
+            );
+
+            // The cursor starts on the first hidden row: checkbox and text reverse.
+            assert!(
+                buf[(2, (label + 2) as u16)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            assert!(
+                buf[(6, (label + 2) as u16)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            // Hidden text is dimmed grey, the tag is dim, and the header text is dim bold.
+            assert_eq!(buf[(6, (label + 3) as u16)].fg, Color::DarkGray);
+            assert!(
+                buf[(38, (label + 3) as u16)]
+                    .modifier
+                    .contains(Modifier::DIM)
+            );
+            assert!(
+                buf[(0, (label + 1) as u16)]
+                    .modifier
+                    .contains(Modifier::DIM)
+            );
+            assert!(
+                buf[(0, (label + 1) as u16)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+        }
+
+        #[test]
+        fn hidden_view_at_32_columns_keeps_the_x_and_the_tag_and_a_blank_above_the_footer() {
+            let (mut app, _files) = hidden_sample();
+            app.toggle_hidden_view();
+            let buf = draw_buffer(&mut app, 32, 24);
+            capture("hidden-32", &buf);
+            let rows = rows_of(&buf);
+            let w = 31;
+            assert!(rows[1].starts_with("4 open \u{b7} 4 done"));
+            assert_eq!(cols(&rows[1], 21, 28), "restore");
+
+            // 19 body rows no longer fit beside a blank row, so the list is scrolled to the
+            // bottom and the footer stays put.
+            assert_eq!(
+                rows[17].trim_end(),
+                with_tag("  [ ] systemctl sta\u{2026}", "superseded", w)
+            );
+            assert_eq!(
+                rows[18].trim_end(),
+                with_tag("  [ ] journalctl -u or\u{2026}", "cleared", w)
+            );
+            assert_eq!(
+                rows[20].trim_end(),
+                with_tag("  [ ] cargo build", "cleared", w)
+            );
+            assert_eq!(rows[21].trim_end(), "", "blank row above the footer");
+            assert_eq!(rows[22].trim_end(), "r restore \u{b7} R restore all");
+            assert_eq!(rows[23].trim_end(), "H back");
+
+            for text in ["  [ ] docker compose ps", "cqc 09:07", "hub 08:54"] {
+                let y = rows
+                    .iter()
+                    .position(|r| r.starts_with(text) && r.trim_end().ends_with('x'))
+                    .unwrap_or_else(|| panic!("{text} lost its x"));
+                assert_eq!(buf[(30, y as u16)].symbol(), "x");
+            }
+        }
+
+        #[test]
+        fn hidden_view_with_nothing_hidden_says_so() {
+            let (mut app, _files) = sample();
+            app.toggle_hidden_view();
+            let buf = draw_buffer(&mut app, 40, 24);
+            let rows = rows_of(&buf);
+            let label = row_index(&rows, "HIDDEN (0)");
+            assert_eq!(rows[label + 1].trim_end(), "Nothing hidden.");
+            assert!(!rows[1].contains("restore"));
         }
     }
 }

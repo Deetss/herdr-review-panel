@@ -94,7 +94,11 @@ reply) and read `~/.claude/review-debug.log`.
 | Clear one row | Click the `x` on its row | `Backspace`/`Delete` |
 | Clear a whole session | Click the `x` on its header | `Backspace`/`Delete` on the header |
 | Clear every done row | Click the `x` on a DONE summary (one session) | `c` |
+| Clear a whole session | - | `S` on any of its rows |
 | Clear everything | Click `clear` (top) | `C` |
+| Show or leave the hidden view | - | `H` (`Esc` also leaves it) |
+| Restore one hidden row, or a session from its header | Click the row's checkbox | `r` |
+| Restore every hidden row | Click `restore` (top, hidden view) | `R` |
 | Close the panel | Click `x` (top) | `Esc` or `q` |
 | Clear does not notify the agent - it only hides the queue. Confirming the finished queue does. | - | - |
 | Scroll | Mouse wheel | `↑`/`↓`/`j`/`k` |
@@ -107,6 +111,12 @@ drawer, and expanding the summary shows it struck through. Unchecking reopens it
 hides a row from the panel. Two footer rows show the keys for whatever the cursor is on.
 The panel starts with the cursor on the newest open row.
 
+`H` adds a HIDDEN section below DONE, grouped by session. Each row is tagged `cleared` (hidden
+by a clear) or `superseded` (replaced by a newer command with the same `id`, or the same kind
+and value, from the same session). A row that is both reads `cleared`. The `clear` button
+becomes `restore`, and the cursor only visits hidden rows. `r` and `R` append `show` events,
+and a `show` on a superseded row brings it back beside its replacement.
+
 ## Where state lives
 
 No file is ever truncated, rewritten or pruned. `~/.claude/review.log` holds the flagged items.
@@ -114,8 +124,8 @@ No file is ever truncated, rewritten or pruned. `~/.claude/review.log` holds the
 `{unix_ts} done|open {key}` and `{unix_ts} hide|show {key}`, and the last event for a key wins.
 A line with no timestamp is a legacy mark and reads as `done` or `hide`. Checking, unchecking
 and clearing append events, so all three persist across restarts and sync live across open
-panel instances. `plugin.sh clear` and the `clear` button append `hide` events and leave
-`review.log` untouched. The files grow without bound by design. There is no time window and no
+panel instances. `plugin.sh clear` runs `review-panel --hide-all <review.log> <cleared.log>`,
+and that and the `clear` button append `hide` events and leave `review.log` untouched. The files grow without bound by design. There is no time window and no
 sweep of done rows, so `REVIEW_PANEL_WINDOW_MINUTES` no longer exists.
 
 A clicked file opens in Orca's editor (`orca file open`) when it lives inside the current

@@ -57,48 +57,13 @@ rebuild_if_stale() {
   fi
 }
 
-# Appends a `hide` event per row of review.log the cleared log does not already hide. No file
-# is cut or rewritten. The key is `ts|session|item`, the same string the panel derives.
+# Appends a `hide` event per visible row. No file is cut or rewritten. The panel binary
+# builds the `ts|session|item` keys, so the script never rebuilds one.
 if [ "$mode" = "clear" ]; then
   [ -r "$QUEUE_LOG" ] || refuse "cannot read $QUEUE_LOG"
-  declare -A hidden=()
-  if [ -r "$CLEARED_LOG" ]; then
-    while IFS= read -r event; do
-      if [[ "$event" =~ ^[0-9]+\ (hide|show)\ (.*)$ ]]; then
-        if [ "${BASH_REMATCH[1]}" = hide ]; then hidden["${BASH_REMATCH[2]}"]=1; else hidden["${BASH_REMATCH[2]}"]=0; fi
-      elif [ -n "$event" ]; then
-        hidden["$event"]=1
-      fi
-    done <"$CLEARED_LOG"
-  fi
-  now=$(date +%s)
-  count=0
-  while IFS= read -r line; do
-    session=""
-    if [[ "$line" == *$'\t'* ]]; then
-      IFS=$'\t' read -ra fields <<<"$line"
-      ts="${fields[0]}"
-      item=""
-      for field in "${fields[@]:1}"; do
-        case "$field" in
-        session=*) session="${field#session=}" ;;
-        item=*) item="${field#item=}" ;;
-        esac
-      done
-    else
-      read -r date time rest <<<"$line"
-      ts="$date $time"
-      [[ "$rest" =~ session=([^\ ]*) ]] && session="${BASH_REMATCH[1]}"
-      item="${rest#*item=}"
-    fi
-    [ -n "$ts" ] && [ -n "$item" ] || continue
-    key="$ts|$session|$item"
-    [ "${hidden[$key]:-0}" = 1 ] && continue
-    printf '%s hide %s\n' "$now" "$key" >>"$CLEARED_LOG" || refuse "cannot append to $CLEARED_LOG"
-    hidden["$key"]=1
-    count=$((count + 1))
-  done <"$QUEUE_LOG"
-  printf 'hid %s rows in %s\n' "$count" "$QUEUE_LOG"
+  rebuild_if_stale
+  [ -x "$BIN" ] || refuse "cannot find $BIN"
+  "$BIN" --hide-all "$QUEUE_LOG" "$CLEARED_LOG" || refuse "cannot append to $CLEARED_LOG"
   exit 0
 fi
 

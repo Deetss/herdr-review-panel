@@ -25,8 +25,6 @@ pub fn hide(path: &Path, key: &str) {
     events::append(path, "hide", key);
 }
 
-// Restore is driven by the hidden view, which arrives in a later phase.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn show(path: &Path, key: &str) {
     events::append(path, "show", key);
 }

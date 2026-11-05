@@ -97,6 +97,23 @@ pub fn section() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// A session header inside the HIDDEN section.
+pub fn hidden_header() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD | Modifier::DIM)
+}
+
+pub fn hidden_command() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+pub fn hidden_command_highlighted() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::REVERSED)
+}
+
 /// The cursor on a DONE summary line: the whole text reverses, the trailing x does not.
 pub fn summary_highlighted() -> Style {
     Style::default()

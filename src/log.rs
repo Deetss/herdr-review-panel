@@ -105,8 +105,7 @@ pub enum Row {
         /// did not resolve on disk, which used to be dropped silently instead of shown.
         warn: Option<String>,
         key: String,
-        // Why the row is hidden. Rendered by the hidden view in a later phase.
-        #[cfg_attr(not(test), allow(dead_code))]
+        /// Why the row is hidden. Only rows in the HIDDEN section carry one.
         hidden: Option<Hidden>,
     },
     /// `key` identifies this exact log entry for the done and cleared logs.
@@ -119,16 +118,20 @@ pub enum Row {
         /// Which terminal/pane/SSH session this targets - see `terminal=` in the module doc.
         terminal: Option<String>,
         key: String,
-        #[cfg_attr(not(test), allow(dead_code))]
         hidden: Option<Hidden>,
+    },
+    /// A session header inside the HIDDEN section: no clear glyph, and `keys` are the
+    /// session's hidden rows so `r` on it restores them all.
+    HiddenHeader {
+        ts: String,
+        repo: String,
+        keys: Vec<String>,
     },
 }
 
 /// The log split by visibility. Both lists are grouped by session, oldest group first.
 pub struct Rows {
     pub visible: Vec<Row>,
-    // Rendered by the hidden view in a later phase.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub hidden: Vec<Row>,
 }
 

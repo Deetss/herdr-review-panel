@@ -48,8 +48,13 @@ pub struct App {
     /// Set once the first frame has reported the real body height.
     sized: bool,
     /// Rows hidden by a `hide` event or by supersession, kept for the hidden view.
-    #[cfg_attr(not(test), allow(dead_code))]
     hidden_rows: Vec<Row>,
+    /// Whether the HIDDEN section is part of the body.
+    hidden_view: bool,
+    /// Number of hidden rows, whether or not the view is on.
+    pub hidden_count: usize,
+    /// Identity of the row the cursor was on when the hidden view opened.
+    saved_cursor: Option<String>,
     /// Index into `rows` of the currently highlighted item - set by keyboard navigation or
     /// mouse hover, whichever moved it most recently. Points at any row type (Backspace on a
     /// GroupHeader clears its whole section), but keyboard Up/Down only ever lands on items.
@@ -128,6 +133,9 @@ impl App {
             done_count: 0,
             sized: false,
             hidden_rows: Vec::new(),
+            hidden_view: false,
+            hidden_count: 0,
+            saved_cursor: None,
             cursor: None,
             scroll: 0,
             close_hovered: false,
@@ -168,6 +176,14 @@ impl App {
         self.rows = body.rows;
         self.open_count = body.open;
         self.done_count = body.done;
+        self.hidden_count = self
+            .hidden_rows
+            .iter()
+            .filter(|r| row_key(r).is_some())
+            .count();
+        if self.hidden_view {
+            queue::append_hidden(&mut self.rows, &self.hidden_rows);
+        }
         self.cursor = match (old_cursor, old_identity) {
             (Some(_), Some(id)) => self
                 .rows
@@ -446,26 +462,47 @@ impl App {
         }
     }
 
-    /// Rows the keyboard cursor can land on. Session headers are reachable by mouse only.
+    /// Rows the keyboard cursor can land on. Session headers are reachable by mouse only. The
+    /// hidden view limits the cursor to the hidden rows, whose one action is restore.
     fn activatable_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.rows.iter().enumerate().filter_map(|(i, r)| {
-            matches!(
-                r,
-                Row::FileItem { .. } | Row::CommandItem { .. } | Row::Summary { .. }
-            )
-            .then_some(i)
+            let reachable = if self.hidden_view {
+                is_hidden_item(r)
+            } else {
+                matches!(
+                    r,
+                    Row::FileItem { .. } | Row::CommandItem { .. } | Row::Summary { .. }
+                )
+            };
+            reachable.then_some(i)
         })
+    }
+
+    pub fn hidden_view(&self) -> bool {
+        self.hidden_view
+    }
+
+    /// Index of the section label that starts with `prefix`.
+    fn section_label(&self, prefix: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label.starts_with(prefix)))
     }
 
     /// Index of the DONE label, if the drawer exists.
     fn done_label(&self) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|r| matches!(r, Row::Section { label } if label.starts_with("DONE")))
+        self.section_label("DONE")
     }
 
-    /// The newest open row, or the first DONE summary when nothing is open.
+    /// The newest open row, or the first DONE summary when nothing is open. In the hidden
+    /// view, the first hidden row.
     fn jump_to_latest(&mut self) {
+        if self.hidden_view {
+            let first = self.activatable_rows().next();
+            self.cursor = first;
+            self.default_scroll();
+            return;
+        }
         let open_end = self.done_label().unwrap_or(self.rows.len());
         self.cursor = self
             .activatable_rows()
@@ -478,6 +515,13 @@ impl App {
     /// The smallest scroll offset that shows the cursor and, when both fit, the DONE label.
     fn default_scroll(&mut self) {
         let height = self.visible_height;
+        if self.hidden_view {
+            // Show the whole HIDDEN section when it fits, else start it at the top.
+            let label = self.section_label("HIDDEN").unwrap_or(0);
+            self.scroll = self.rows.len().saturating_sub(height).min(label);
+            self.ensure_cursor_visible();
+            return;
+        }
         let Some(cursor) = self.cursor else {
             self.scroll = 0;
             return;
@@ -558,7 +602,10 @@ impl App {
     /// Space/'d' (keyboard) or a click on the checkbox column (mouse): toggle the command at
     /// the cursor done/not-done. No-op for file rows, which have no done state.
     pub fn toggle_done_cursor(&mut self) {
-        if let Some(Row::CommandItem { key, .. }) = self.cursor.and_then(|c| self.rows.get(c)) {
+        if let Some(Row::CommandItem {
+            key, hidden: None, ..
+        }) = self.cursor.and_then(|c| self.rows.get(c))
+        {
             let key = key.clone();
             self.toggle_done(&key);
         }
@@ -577,6 +624,10 @@ impl App {
     fn clear_row_at(&mut self, idx: usize) {
         match self.rows.get(idx) {
             Some(row @ (Row::FileItem { .. } | Row::CommandItem { .. })) => {
+                // A hidden row's one action is restore.
+                if is_hidden_item(row) {
+                    return;
+                }
                 if let Some(key) = row_key(row) {
                     let key = key.to_string();
                     self.mark_cleared(&key);
@@ -611,11 +662,146 @@ impl App {
         self.jump_to_latest();
     }
 
+    /// `S`: hides every row, open and done, of the session the cursor is in.
+    pub fn clear_session(&mut self) {
+        let Some(idx) = self.cursor else { return };
+        for key in self.session_keys(idx) {
+            self.mark_cleared(&key);
+        }
+        self.rebuild();
+        self.jump_to_latest();
+    }
+
+    /// Keys of the visible rows in the session that owns row `idx`. Empty for rows outside
+    /// OPEN and DONE, including everything in the HIDDEN section.
+    fn session_keys(&self, idx: usize) -> Vec<String> {
+        let Some(row) = self.rows.get(idx) else {
+            return Vec::new();
+        };
+        if matches!(
+            row,
+            Row::Blank | Row::Section { .. } | Row::Note(_) | Row::HiddenHeader { .. }
+        ) || is_hidden_item(row)
+        {
+            return Vec::new();
+        }
+        let owner = self.rows[..=idx]
+            .iter()
+            .rposition(|r| matches!(r, Row::GroupHeader { .. } | Row::Summary { .. }));
+        match owner.and_then(|i| self.rows.get(i)) {
+            Some(Row::GroupHeader { keys, .. }) => keys.clone(),
+            Some(Row::Summary { group, .. }) => self
+                .log_rows
+                .iter()
+                .find_map(|r| match r {
+                    Row::GroupHeader {
+                        session,
+                        repo,
+                        keys,
+                        ..
+                    } if queue::group_id(session, repo) == *group => Some(keys.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `H`: shows or hides the HIDDEN section. Opening it moves the cursor to the first hidden
+    /// row; closing it puts the cursor back on the row it left.
+    pub fn toggle_hidden_view(&mut self) {
+        if self.hidden_view {
+            self.hidden_view = false;
+            let saved = self.saved_cursor.take();
+            self.rebuild();
+            self.cursor = saved
+                .and_then(|id| {
+                    self.rows
+                        .iter()
+                        .position(|r| queue::identity(r).as_deref() == Some(id.as_str()))
+                })
+                .or(self.cursor);
+            self.default_scroll();
+        } else {
+            self.saved_cursor = self
+                .cursor
+                .and_then(|c| self.rows.get(c))
+                .and_then(queue::identity);
+            self.hidden_view = true;
+            self.rebuild();
+            self.jump_to_latest();
+        }
+    }
+
+    /// `Esc`: leaves the hidden view, else closes the panel.
+    pub fn escape(&mut self) {
+        if self.hidden_view {
+            self.toggle_hidden_view();
+        } else {
+            self.click_close();
+        }
+    }
+
+    /// `r`: restores the hidden row under the cursor, or a whole session from its header.
+    pub fn restore_cursor(&mut self) {
+        if let Some(idx) = self.cursor {
+            self.restore_at(idx);
+        }
+    }
+
+    fn restore_at(&mut self, idx: usize) {
+        let keys: Vec<String> = match self.rows.get(idx) {
+            Some(row) if is_hidden_item(row) => {
+                row_key(row).map(str::to_string).into_iter().collect()
+            }
+            Some(Row::HiddenHeader { keys, .. }) => keys.clone(),
+            _ => return,
+        };
+        // Where the cursor sits among the hidden rows, so it can stay near that spot.
+        let nth = self.rows[..idx]
+            .iter()
+            .filter(|r| is_hidden_item(r))
+            .count();
+        self.show_keys(&keys);
+        let remaining: Vec<usize> = self.activatable_rows().collect();
+        self.cursor = remaining
+            .get(nth.min(remaining.len().saturating_sub(1)))
+            .copied();
+        self.ensure_cursor_visible();
+    }
+
+    /// `R` and the `restore` button: restores every hidden row.
+    pub fn restore_all(&mut self) {
+        let keys: Vec<String> = self
+            .hidden_rows
+            .iter()
+            .filter_map(|r| row_key(r).map(str::to_string))
+            .collect();
+        self.show_keys(&keys);
+        let first = self.activatable_rows().next();
+        self.cursor = first;
+        self.default_scroll();
+    }
+
+    fn show_keys(&mut self, keys: &[String]) {
+        for key in keys {
+            cleared::show(&self.cleared_path, key);
+            self.cleared.insert(key.clone(), false);
+        }
+        self.rebuild();
+    }
+
     /// `list_width` is the rendered row width - clicking its rightmost column always clears
     /// that row (or, for a GroupHeader, its whole section), matching the trailing "x" ui.rs
     /// draws there. Anywhere else on a command row before CHECKBOX_END_COL toggles done;
     /// past it (or anywhere on a file row) opens/copies as usual.
     pub fn click_row(&mut self, row_idx: usize, local_col: u16, list_width: u16) {
+        if self.rows.get(row_idx).is_some_and(is_hidden_item) {
+            if local_col < CHECKBOX_END_COL {
+                self.restore_at(row_idx);
+            }
+            return;
+        }
         if local_col + 1 >= list_width {
             self.clear_row_at(row_idx);
             return;
@@ -633,6 +819,10 @@ impl App {
     /// The top "clear" button and `C`: appends a `hide` event for every visible row, open and
     /// done (the logs themselves are never cut). The panel stays open on the empty state.
     pub fn click_clear_all(&mut self) {
+        if self.hidden_view {
+            self.restore_all();
+            return;
+        }
         let keys: Vec<String> = self
             .log_rows
             .iter()
@@ -649,7 +839,7 @@ impl App {
     /// The finish prompt's "yes": hides the queue, notifies the flagging agent, then closes
     /// the panel the same way click_close does.
     fn clear_and_close(&mut self, notify_message: Option<&str>) {
-        actions::clear_all(&self.log_path, &self.cleared_path);
+        let _ = actions::clear_all(&self.log_path, &self.cleared_path);
         if let (Some(message), Some(target)) = (notify_message, self.notify_target.as_ref()) {
             actions::notify_agent(target, message);
         }
@@ -726,10 +916,24 @@ fn row_key(row: &Row) -> Option<&str> {
         Row::FileItem { key, .. } | Row::CommandItem { key, .. } => Some(key),
         Row::Blank
         | Row::GroupHeader { .. }
+        | Row::HiddenHeader { .. }
         | Row::Section { .. }
         | Row::Note(_)
         | Row::Summary { .. } => None,
     }
+}
+
+fn is_hidden_item(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::FileItem {
+            hidden: Some(_),
+            ..
+        } | Row::CommandItem {
+            hidden: Some(_),
+            ..
+        }
+    )
 }
 
 enum Activation {
@@ -741,9 +945,15 @@ fn plan_activation(row: &Row) -> Option<Activation> {
     match row {
         Row::FileItem {
             abspath: Some(path),
+            hidden: None,
             ..
         } => Some(Activation::OpenFile(path.clone())),
-        Row::CommandItem { command, key, .. } => Some(Activation::CopyCommand {
+        Row::CommandItem {
+            command,
+            key,
+            hidden: None,
+            ..
+        } => Some(Activation::CopyCommand {
             command: command.clone(),
             key: key.clone(),
         }),
@@ -1214,6 +1424,221 @@ mod tests {
         f.app.poll();
         assert_eq!(f.app.rows.len(), 3);
         assert!(f.app.hidden_rows.is_empty());
+    }
+
+    fn command_at(ts: &str, session: &str, repo: &str, item: &str) -> String {
+        format!("{ts} session={session} repo={repo} cwd=/home/d kind=command item={item}\n")
+    }
+
+    /// Two sessions. `echo a` is posted twice in s1, so the first copy is superseded.
+    const SUPERSEDED_LOG: [(&str, &str, &str, &str); 4] = [
+        ("2026-11-05 09:00:00", "s1", "r1", "echo a"),
+        ("2026-11-05 09:01:00", "s1", "r1", "echo a"),
+        ("2026-11-05 09:02:00", "s2", "r2", "echo b"),
+        ("2026-11-05 09:03:00", "s2", "r2", "echo c"),
+    ];
+
+    fn superseded_fixture() -> Fixture {
+        let log: String = SUPERSEDED_LOG
+            .iter()
+            .map(|(ts, s, r, i)| command_at(ts, s, r, i))
+            .collect();
+        fixture(&log)
+    }
+
+    fn show_events(app: &App) -> usize {
+        std::fs::read_to_string(&app.cleared_path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(" show "))
+            .count()
+    }
+
+    fn open_commands(app: &App) -> Vec<String> {
+        app.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::CommandItem {
+                    command,
+                    key,
+                    hidden: None,
+                    ..
+                } if !app.is_done(key) => Some(format!("{command}@{}", &key[11..16])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_view_never_shows_hidden_rows() {
+        let f = superseded_fixture();
+        assert_eq!((f.app.open_count, f.app.hidden_count), (3, 1));
+        assert!(!f.app.hidden_view());
+        assert!(f.app.rows.iter().all(|r| !matches!(
+            r,
+            Row::HiddenHeader { .. }
+                | Row::CommandItem {
+                    hidden: Some(_),
+                    ..
+                }
+        )));
+        assert!(f.app.section_label("HIDDEN").is_none());
+    }
+
+    #[test]
+    fn h_shows_the_hidden_section_and_h_again_hides_it_and_returns_the_cursor() {
+        let mut f = superseded_fixture();
+        let before = f.app.cursor;
+        let before_id = queue::identity(&f.app.rows[before.unwrap()]);
+
+        f.app.toggle_hidden_view();
+        assert!(f.app.hidden_view());
+        let label = f.app.section_label("HIDDEN (1)").expect("HIDDEN label");
+        assert!(matches!(f.app.rows[label - 1], Row::Blank));
+        let cursor = f.app.cursor.unwrap();
+        assert!(cursor > label);
+        assert!(matches!(
+            &f.app.rows[cursor],
+            Row::CommandItem {
+                hidden: Some(crate::log::Hidden::Superseded),
+                ..
+            }
+        ));
+
+        f.app.toggle_hidden_view();
+        assert!(!f.app.hidden_view());
+        assert!(f.app.section_label("HIDDEN").is_none());
+        assert_eq!(f.app.cursor, before);
+        assert_eq!(
+            queue::identity(&f.app.rows[f.app.cursor.unwrap()]),
+            before_id
+        );
+    }
+
+    #[test]
+    fn escape_leaves_the_hidden_view_without_closing_the_panel() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        f.app.escape();
+        assert!(!f.app.hidden_view());
+        assert!(!f.app.should_quit);
+    }
+
+    #[test]
+    fn r_restores_a_superseded_row_beside_its_replacement() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        f.app.restore_cursor();
+
+        assert_eq!(show_events(&f.app), 1);
+        assert_eq!((f.app.open_count, f.app.hidden_count), (4, 0));
+        f.app.toggle_hidden_view();
+        let open = open_commands(&f.app);
+        let first = open.iter().position(|c| c == "echo a@09:00").unwrap();
+        let second = open.iter().position(|c| c == "echo a@09:01").unwrap();
+        assert_eq!(second, first + 1, "{open:?}");
+    }
+
+    #[test]
+    fn r_on_a_cleared_row_restores_it_and_the_cursor_stays_in_the_hidden_view() {
+        let mut f = superseded_fixture();
+        // Hide `echo c`, the newest open row.
+        f.app.clear_cursor();
+        assert_eq!(f.app.hidden_count, 2);
+        f.app.toggle_hidden_view();
+        f.app.restore_cursor();
+
+        assert_eq!(f.app.hidden_count, 1);
+        assert!(f.app.hidden_view());
+        let cursor = f.app.cursor.expect("cursor stays on a hidden row");
+        assert!(is_hidden_item(&f.app.rows[cursor]));
+    }
+
+    #[test]
+    fn capital_r_restores_every_hidden_row() {
+        let mut f = superseded_fixture();
+        f.app.clear_cursor(); // hide `echo c`
+        f.app.toggle_hidden_view();
+        f.app.restore_all();
+
+        assert_eq!(show_events(&f.app), 2);
+        assert_eq!(f.app.hidden_count, 0);
+        assert_eq!(f.app.open_count, 4);
+        assert!(f.app.section_label("HIDDEN (0)").is_some());
+        assert_eq!(f.app.cursor, None);
+    }
+
+    #[test]
+    fn restoring_never_rewrites_the_logs() {
+        let mut f = superseded_fixture();
+        let log_before = std::fs::read(f._log.path()).unwrap();
+        f.app.toggle_hidden_view();
+        f.app.restore_all();
+        assert_eq!(std::fs::read(f._log.path()).unwrap(), log_before);
+        let events = std::fs::read_to_string(&f.app.cleared_path).unwrap();
+        assert_eq!(events.lines().count(), 1);
+    }
+
+    #[test]
+    fn clicking_a_hidden_rows_checkbox_restores_it_and_the_rest_of_the_row_does_nothing() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        let idx = f.app.cursor.unwrap();
+        f.app.click_row(idx, CHECKBOX_END_COL + 2, 39);
+        f.app.click_row(idx, 38, 39); // the reason column, not an x
+        assert_eq!(f.app.hidden_count, 1);
+        f.app.click_row(idx, 0, 39);
+        assert_eq!(f.app.hidden_count, 0);
+    }
+
+    #[test]
+    fn s_hides_only_the_cursors_session() {
+        let mut f = superseded_fixture();
+        // The cursor starts on `echo c` in s2. Marking it done leaves it in s2's DONE drawer.
+        f.app.toggle_done_cursor();
+        f.app.clear_session();
+
+        assert_eq!(open_commands(&f.app), vec!["echo a@09:01".to_string()]);
+        assert_eq!(
+            f.app.done_count, 0,
+            "the done row of s2 went with the session"
+        );
+        let hides = std::fs::read_to_string(&f.app.cleared_path).unwrap();
+        assert_eq!(hides.lines().filter(|l| l.contains(" hide ")).count(), 2);
+        assert!(hides.contains("|s2|echo b") && hides.contains("|s2|echo c"));
+        assert!(!hides.contains("|s1|"));
+    }
+
+    #[test]
+    fn s_does_nothing_on_a_hidden_row() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        f.app.clear_session();
+        assert_eq!(f.app.hidden_count, 1);
+        assert_eq!(f.app.open_count, 3);
+    }
+
+    #[test]
+    fn hidden_rows_ignore_space_enter_and_backspace() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        f.app.toggle_done_cursor();
+        f.app.activate_cursor();
+        f.app.clear_cursor();
+        assert_eq!(
+            (f.app.open_count, f.app.done_count, f.app.hidden_count),
+            (3, 0, 1)
+        );
+        assert!(f.app.status_text().is_none());
+    }
+
+    #[test]
+    fn the_restore_button_restores_all_in_the_hidden_view() {
+        let mut f = superseded_fixture();
+        f.app.toggle_hidden_view();
+        f.app.click_clear_all();
+        assert_eq!(f.app.hidden_count, 0);
+        assert!(f.app.hidden_view());
     }
 
     #[test]

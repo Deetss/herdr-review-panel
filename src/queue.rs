@@ -36,7 +36,7 @@ fn item_key(row: &Row) -> Option<&str> {
 }
 
 /// Stable name for a session across rebuilds. A legacy line with no session groups by repo.
-fn group_id(session: &str, repo: &str) -> String {
+pub fn group_id(session: &str, repo: &str) -> String {
     if session.is_empty() {
         repo.to_string()
     } else {
@@ -166,6 +166,53 @@ pub fn build_body(visible: &[Row], done: &HashSet<String>, expanded: &HashSet<St
         open: open_total,
         done: done_total,
     }
+}
+
+/// Appends the HIDDEN section after the OPEN and DONE rows. `hidden` is the session-grouped
+/// list from `log::build_rows`, whose group headers become `HiddenHeader`s. Returns the
+/// number of hidden items.
+pub fn append_hidden(rows: &mut Vec<Row>, hidden: &[Row]) -> usize {
+    let mut groups: Vec<(Row, Vec<Row>)> = Vec::new();
+    for row in hidden {
+        match row {
+            Row::GroupHeader { ts, repo, .. } => groups.push((
+                Row::HiddenHeader {
+                    ts: ts.clone(),
+                    repo: repo.clone(),
+                    keys: Vec::new(),
+                },
+                Vec::new(),
+            )),
+            Row::FileItem { .. } | Row::CommandItem { .. } => {
+                if let Some((_, items)) = groups.last_mut() {
+                    items.push(row.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let total: usize = groups.iter().map(|(_, items)| items.len()).sum();
+    if !rows.is_empty() {
+        rows.push(Row::Blank);
+    }
+    rows.push(Row::Section {
+        label: format!("HIDDEN ({total})"),
+    });
+    if total == 0 {
+        rows.push(Row::Note("Nothing hidden.".to_string()));
+    }
+    for (mut header, items) in groups {
+        if let Row::HiddenHeader { keys, .. } = &mut header {
+            *keys = items
+                .iter()
+                .filter_map(item_key)
+                .map(str::to_string)
+                .collect();
+        }
+        rows.push(header);
+        rows.extend(items);
+    }
+    total
 }
 
 #[cfg(test)]
